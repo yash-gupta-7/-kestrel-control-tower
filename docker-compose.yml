@@ -1,0 +1,94 @@
+name: kestrel-control-tower
+
+# Requires ASSIGNMENT_PACK_DIR pointing at the unzipped FDE assignment pack
+# (the folder containing data/kestrel_ops.db, bazaarpulse_site/,
+# partner_api/). Copy .env.example to .env and set it there. None of that
+# data is in this repo -- see README and DECISIONS.md.
+
+services:
+  bazaarpulse:
+    image: python:3.11-slim
+    working_dir: /site
+    volumes:
+      - ${ASSIGNMENT_PACK_DIR}/bazaarpulse_site:/site:ro
+    command: python3 -m http.server 8080
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/index.html')"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  partner-api:
+    build:
+      context: .
+      dockerfile: docker/partner-api.Dockerfile
+    working_dir: /app
+    volumes:
+      - ${ASSIGNMENT_PACK_DIR}/partner_api:/app:ro
+    ports:
+      - "8088:8088"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8088/v1/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  etl:
+    build:
+      context: .
+      dockerfile: etl/Dockerfile
+    depends_on:
+      bazaarpulse:
+        condition: service_healthy
+      partner-api:
+        condition: service_healthy
+    volumes:
+      - ${ASSIGNMENT_PACK_DIR}/data:/data:ro
+      - warehouse_data:/app/warehouse
+      - cache_data:/app/cache
+    environment:
+      KESTREL_DB_PATH: /data/kestrel_ops.db
+      BAZAARPULSE_BASE_URL: http://bazaarpulse:8080
+      PARTNER_API_BASE_URL: http://partner-api:8088
+      WAREHOUSE_DB_PATH: /app/warehouse/warehouse.duckdb
+      CACHE_DIR: /app/cache
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    depends_on:
+      etl:
+        condition: service_completed_successfully
+    volumes:
+      - warehouse_data:/app/warehouse:ro
+    environment:
+      WAREHOUSE_DB_PATH: /app/warehouse/warehouse.duckdb
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+
+volumes:
+  warehouse_data:
+  cache_data:
