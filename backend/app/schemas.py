@@ -22,6 +22,27 @@ class MetricResponse(BaseModel):
     caveats: list[str] = Field(default_factory=list)
 
 
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=3, max_length=500)
+
+
+class AskResult(BaseModel):
+    question: str
+    mode: Literal["fast_path", "llm", "llm_not_implemented", "unavailable"]
+    answer: str
+    data: Optional[list[dict[str, Any]]] = None
+    sql: Optional[str] = None
+    source: Optional[str] = None
+    caveats: list[str] = Field(default_factory=list)
+    matched_question_id: Optional[str] = None
+
+
+class SupportedQuestion(BaseModel):
+    id: str
+    example: str
+    description: str
+
+
 class HealthResponse(BaseModel):
     status: str
     warehouse_found: bool
