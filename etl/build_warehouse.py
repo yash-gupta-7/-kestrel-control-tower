@@ -263,6 +263,30 @@ def build_fact_returns(con):
     """)
 
 
+def build_fact_inventory(con):
+    """Weekly warehouse x SKU x batch snapshots, with near-expiry computed
+    directly from expiry_date - snapshot_date. NOT from `ageing_bucket`:
+    checked, and that column is uncorrelated with actual days-to-expiry
+    (all four buckets average ~100 days regardless of label) -- carried
+    through unchanged for reference but not used for anything here."""
+    con.execute("""
+        CREATE OR REPLACE TABLE fact_inventory_snapshot AS
+        SELECT
+            s.snapshot_id,
+            CAST(s.snapshot_date AS DATE) AS snapshot_date,
+            s.warehouse_id, s.product_id, s.batch_id,
+            s.on_hand_cases, s.on_hand_eaches, s.allocated_cases, s.available_cases,
+            s.days_of_cover,
+            CAST(s.expiry_date AS DATE) AS expiry_date,
+            s.ageing_bucket,  -- kept for reference only; do not trust, see docstring
+            DATE_DIFF('day', CAST(s.snapshot_date AS DATE), CAST(s.expiry_date AS DATE)) AS days_to_expiry,
+            s.damaged_cases, s.blocked_cases, s.storage_temp_celsius,
+            p.sku_code, p.category, p.is_chilled
+        FROM raw.inventory_snapshots s
+        JOIN dim_product p ON p.product_id = s.product_id
+    """)
+
+
 def build_fact_freight(con):
     freight_csv = config.FREIGHT_CACHE / "freight_invoices.csv"
     if not freight_csv.exists():
@@ -425,6 +449,9 @@ def main():
 
     print("Building fact_returns...")
     build_fact_returns(con)
+
+    print("Building fact_inventory_snapshot...")
+    build_fact_inventory(con)
 
     print("Building fact_freight...")
     build_fact_freight(con)

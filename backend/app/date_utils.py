@@ -10,8 +10,14 @@ from datetime import date
 
 
 def fiscal_year(d: date) -> int:
-    """Kestrel's FY runs April-March (per assignment brief)."""
-    return d.year if d.month >= 4 else d.year - 1
+    """Kestrel's FY runs April-March (per assignment brief). FY label is
+    the calendar year the FY *ends* in -- the standard Indian corporate
+    convention (e.g. "FY2027" is used for the year ending 31 Mar 2027), and
+    the convention explicitly requested on review. So 1 Apr 2026 -
+    30 Jun 2026 is "FY2027 Q1", not "FY2026 Q1". Corrected after an initial
+    (wrong) implementation used the starting year instead -- see
+    DECISIONS.md."""
+    return d.year + 1 if d.month >= 4 else d.year
 
 
 def fiscal_quarter(d: date) -> int:

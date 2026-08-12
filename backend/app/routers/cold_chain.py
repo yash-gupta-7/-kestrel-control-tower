@@ -97,3 +97,61 @@ def cold_chain_returns(fiscal_year: Optional[int] = None, fiscal_quarter: Option
             "stock' is grouped with cold chain), not because it is definitionally a cold-chain failure.",
         ],
     )
+
+
+@router.get("/near-expiry", response_model=MetricResponse)
+def near_expiry(
+    group_by: str = "category",
+    near_expiry_days: int = 30,
+    warehouse_code: Optional[str] = None,
+):
+    """Stock expiring within `near_expiry_days` of the LATEST inventory
+    snapshot (this is a point-in-time stock position, not a period metric --
+    there is exactly one 'now' for on-hand stock, unlike orders/deliveries
+    which accumulate over a date range)."""
+    if group_by not in ("category", "warehouse"):
+        group_by = "category"
+    needs_warehouse_join = group_by == "warehouse" or warehouse_code is not None
+    dim_select = (
+        "s.category AS dim_code, s.category AS dim_label" if group_by == "category"
+        else "w.warehouse_code AS dim_code, w.warehouse_name AS dim_label"
+    )
+    dim_join = "JOIN dim_warehouse w ON w.warehouse_id = s.warehouse_id" if needs_warehouse_join else ""
+    warehouse_filter = "AND w.warehouse_code = ?" if warehouse_code else ""
+
+    sql = f"""
+        WITH latest AS (SELECT MAX(snapshot_date) AS d FROM fact_inventory_snapshot)
+        SELECT {dim_select},
+               SUM(s.on_hand_cases) AS on_hand_cases,
+               SUM(CASE WHEN s.days_to_expiry BETWEEN 0 AND ? THEN s.on_hand_cases ELSE 0 END) AS near_expiry_cases,
+               ROUND(100.0 * SUM(CASE WHEN s.days_to_expiry BETWEEN 0 AND ? THEN s.on_hand_cases ELSE 0 END)
+                     / NULLIF(SUM(s.on_hand_cases), 0), 1) AS near_expiry_pct
+        FROM fact_inventory_snapshot s
+        {dim_join}
+        WHERE s.snapshot_date = (SELECT d FROM latest) {warehouse_filter}
+        GROUP BY 1, 2
+        ORDER BY near_expiry_pct DESC
+    """
+    # near_expiry_days is bound twice (near_expiry_cases, near_expiry_pct);
+    # warehouse_code, if given, is bound once more for the filter clause.
+    params = [near_expiry_days, near_expiry_days] + ([warehouse_code] if warehouse_code else [])
+    with get_connection() as con:
+        as_of = con.execute("SELECT MAX(snapshot_date) FROM fact_inventory_snapshot").fetchone()[0]
+        rows = run_query(con, sql, params)
+
+    return MetricResponse(
+        metric="near_expiry_stock",
+        group_by=group_by,
+        period_label=f"as of latest snapshot ({as_of})",
+        filters_applied={"near_expiry_days": near_expiry_days, "warehouse_code": warehouse_code},
+        rows=[MetricRow(dimension=r["dim_code"], dimension_label=r["dim_label"],
+                         metrics={k: v for k, v in r.items() if k not in ("dim_code", "dim_label")})
+              for r in rows],
+        caveats=[
+            "Near-expiry is computed from expiry_date - snapshot_date directly, NOT from the source "
+            "ageing_bucket column: checked, and ageing_bucket is uncorrelated with actual days-to-expiry "
+            "(all four buckets average ~100 days to expiry regardless of label) -- it is unusable and "
+            "not relied on anywhere in this build.",
+            "Point-in-time as of the latest weekly snapshot, not a period-filtered metric.",
+        ],
+    )

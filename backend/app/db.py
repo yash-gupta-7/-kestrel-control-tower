@@ -28,7 +28,7 @@ ALLOWED_TABLES = {
     "dim_region", "dim_warehouse", "dim_route", "dim_salesperson",
     "dim_outlet", "dim_product", "dim_date",
     "fact_order_lines", "fact_deliveries", "fact_returns", "fact_freight",
-    "fact_price_position", "fact_weather",
+    "fact_price_position", "fact_weather", "fact_inventory_snapshot",
 }
 
 
