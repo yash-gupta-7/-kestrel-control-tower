@@ -49,7 +49,7 @@ _DIM_CONFIG = {
 def fill_rate(
     group_by: GroupBy = Query("outlet"),
     fiscal_year: Optional[int] = None,
-    fiscal_quarter: Optional[int] = None,
+    fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
     month: Optional[str] = Query(None, description="YYYY-MM, overrides fiscal_year/quarter if given"),
     exclude_test_outlets: bool = True,
     exclude_closed_outlets: bool = False,
@@ -63,9 +63,13 @@ def fill_rate(
 
     period_sql, period_params, period_label = period_filter(fiscal_year, fiscal_quarter, month, "ol.order_date")
     if period_sql:
-        # period_sql is "AND <condition>"; strip the leading "AND " to fold
-        # it into where_clauses (joined with " AND " below).
-        where_clauses.append(period_sql.replace("AND ", ""))
+        # period_sql is "AND <condition>"; strip only the leading "AND " to
+        # fold it into where_clauses (joined with " AND " below) -- a bare
+        # .replace("AND ", "") here would also strip the "AND" inside
+        # "BETWEEN ? AND ?", corrupting the query. Found by testing this
+        # exact group_by=outlet + fiscal_year/quarter combination, which
+        # wasn't exercised in the Phase 3 checkpoint.
+        where_clauses.append(period_sql.removeprefix("AND "))
         params += period_params
 
     outlet_join = ""
@@ -138,7 +142,7 @@ def fill_rate(
 def otif(
     group_by: Literal["region", "warehouse", "route"] = Query("region"),
     fiscal_year: Optional[int] = None,
-    fiscal_quarter: Optional[int] = None,
+    fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
     month: Optional[str] = None,
     on_time_threshold_minutes: int = Query(0, description="delay_minutes <= this counts as on-time"),
     order: Literal["asc", "desc"] = Query("asc"),

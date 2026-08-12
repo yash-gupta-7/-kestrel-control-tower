@@ -18,7 +18,7 @@ router = APIRouter(prefix="/money", tags=["money"])
 def freight_cost_per_case(
     group_by: Literal["warehouse", "carrier"] = Query("warehouse"),
     fiscal_year: Optional[int] = None,
-    fiscal_quarter: Optional[int] = None,
+    fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
     month: Optional[str] = None,
     limit: int = Query(50, ge=1, le=500),
 ):
@@ -109,7 +109,7 @@ def freight_cost_per_case(
 def returns_leakage(
     group_by: Literal["category", "carrier"] = Query("category"),
     fiscal_year: Optional[int] = None,
-    fiscal_quarter: Optional[int] = None,
+    fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
     month: Optional[str] = None,
     limit: int = Query(50, ge=1, le=500),
 ):

@@ -21,7 +21,7 @@ COLD_CHAIN_REASON_CODES = ("RT01_NEAR_EXPIRY", "RT06_COLD_CHAIN_BREACH")
 
 
 @router.get("/excursions", response_model=MetricResponse)
-def excursions(fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] = None,
+def excursions(fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
                month: Optional[str] = None):
     period_sql, params, period_label = period_filter(fiscal_year, fiscal_quarter, month, "d.dispatch_datetime")
 
@@ -65,7 +65,7 @@ def excursions(fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] 
 
 
 @router.get("/returns", response_model=MetricResponse)
-def cold_chain_returns(fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] = None,
+def cold_chain_returns(fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
                         month: Optional[str] = None, limit: int = 50):
     period_sql, params, period_label = period_filter(fiscal_year, fiscal_quarter, month, "return_date")
     reason_list = ", ".join(f"'{r}'" for r in COLD_CHAIN_REASON_CODES)
