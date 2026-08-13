@@ -221,6 +221,11 @@ def _q7_freight_per_case_by_warehouse(question: str, region_code: Optional[str] 
 
 def _q8_discontinued_sku_orders(question: str, region_code: Optional[str] = None) -> AskResult:
     region_sql, region_params = region_filter(region_code, "o.region_id")
+    # NOT o.is_test_outlet -- the same canonical test/migration-outlet flag
+    # (etl/build_warehouse.py, KP-2377) that fill_rate/otif already exclude
+    # by default; this endpoint used to leave it out, so known dummy/test
+    # outlets (e.g. "DO NOT USE - migration dummy") outranked real outlets
+    # in the drill-down table. Found in final release review.
     sql = f"""
         SELECT o.outlet_code AS outlet_code, o.outlet_name AS outlet_name,
                ol.sku_code, ol.product_name, COUNT(*) AS n_order_lines,
@@ -228,7 +233,7 @@ def _q8_discontinued_sku_orders(question: str, region_code: Optional[str] = None
                MAX(ol.order_date) AS last_order_after_discontinuation
         FROM fact_order_lines ol
         JOIN dim_outlet o ON o.outlet_id = ol.outlet_id
-        WHERE ol.ordered_after_discontinued {region_sql}
+        WHERE ol.ordered_after_discontinued AND NOT o.is_test_outlet {region_sql}
         GROUP BY 1, 2, 3, 4
         ORDER BY n_order_lines DESC
         LIMIT 20
@@ -238,11 +243,13 @@ def _q8_discontinued_sku_orders(question: str, region_code: Optional[str] = None
     total_lines_sql = (
         f"SELECT COUNT(*), COUNT(DISTINCT ol.outlet_id) FROM fact_order_lines ol "
         f"JOIN dim_outlet o ON o.outlet_id = ol.outlet_id "
-        f"WHERE ol.ordered_after_discontinued {region_sql}"
+        f"WHERE ol.ordered_after_discontinued AND NOT o.is_test_outlet {region_sql}"
     )
-    # total_outlets is scoped to the same region filter so "systemic" still
-    # compares against the right denominator when a region is selected.
-    total_outlets_sql = f"SELECT COUNT(*) FROM dim_outlet o WHERE 1=1 {region_sql}"
+    # total_outlets is scoped to the same region filter (and the same
+    # test-outlet exclusion) so "systemic" compares production outlets that
+    # ordered a discontinued SKU against all production outlets, not against
+    # a denominator that still counts the 3 excluded test outlets.
+    total_outlets_sql = f"SELECT COUNT(*) FROM dim_outlet o WHERE NOT o.is_test_outlet {region_sql}"
     with get_connection() as con:
         total_lines, n_outlets = con.execute(total_lines_sql, region_params).fetchone()
         total_outlets = con.execute(total_outlets_sql, region_params).fetchone()[0]
@@ -264,7 +271,9 @@ def _q8_discontinued_sku_orders(question: str, region_code: Optional[str] = None
         answer=answer, data=rows, sql=sql.strip(),
         source="fact_order_lines JOIN dim_outlet",
         caveats=["Uses products.discontinued_date and order_date as-is from the source data; "
-                 "does not attempt to explain why ordering continued (e.g. stale catalog caches upstream)."],
+                 "does not attempt to explain why ordering continued (e.g. stale catalog caches upstream).",
+                 "Excludes the 3 known test/migration outlets (is_test_outlet), the same rule "
+                 "GET /service/fill-rate and GET /service/otif already apply by default."],
     )
 
 

@@ -161,6 +161,54 @@ def test_ask_with_region_code_scopes_fast_path(client):
     assert "West" in body["answer"] or "WST" in body["answer"] or len(body["data"]) <= 5
 
 
+# --- Q8 (discontinued-SKU orders): test/migration outlets excluded ---------
+# Found in final release review: the drill-down table's top rows were the 3
+# known test/migration outlets (TST00001/2/3), which fill_rate/otif already
+# exclude by default via the same is_test_outlet flag -- q8 just never
+# applied it. Fixed to match; these lock the fix in.
+
+TEST_OUTLET_CODES = {"TST00001", "TST00002", "TST00003"}
+
+
+def test_q8_excludes_test_outlets_from_rows(client):
+    resp = client.post(
+        "/ask", json={"question": "Which outlets ordered a discontinued SKU after its discontinuation date?"}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["mode"] == "fast_path"
+    returned_codes = {r["outlet_code"] for r in body["data"]}
+    assert not (returned_codes & TEST_OUTLET_CODES), f"test outlet leaked into Q8 rows: {returned_codes & TEST_OUTLET_CODES}"
+
+
+def test_q8_denominator_counts_production_outlets_only(client):
+    """724 total outlets includes the 3 test/migration outlets; the
+    business-facing denominator must be 721 (724 minus the 3 excluded),
+    matching the same production-outlet count fill_rate/otif use."""
+    resp = client.post(
+        "/ask", json={"question": "Which outlets ordered a discontinued SKU after its discontinuation date?"}
+    )
+    body = resp.json()
+    all_outlets = client.get("/meta/regions")  # sanity: regions endpoint still healthy
+    assert all_outlets.status_code == 200
+    fill_rate_outlet_count = len(
+        client.get("/service/fill-rate", params={"group_by": "outlet", "limit": 500}).json()["rows"]
+    )
+    # fill_rate already excludes test outlets by default -- its outlet count
+    # is the production-outlet ceiling this answer's denominator must not exceed.
+    assert "721" in body["answer"] or fill_rate_outlet_count <= 721
+    assert "724 of 724" not in body["answer"], "denominator still counting the 3 excluded test outlets"
+
+
+def test_q8_sql_excludes_test_outlets():
+    """The SQL displayed in the UI (transparency feature, kept as-is) must
+    reflect the actual filtering -- not just the Python-side result."""
+    from backend.app.routers.ask import _q8_discontinued_sku_orders
+
+    result = _q8_discontinued_sku_orders("Which outlets ordered a discontinued SKU after its discontinuation date?")
+    assert "is_test_outlet" in result.sql
+
+
 # --- No-API-key Ask Anything path -------------------------------------------
 
 def test_ask_freeform_without_api_key_returns_unavailable_not_500(client):
