@@ -8,7 +8,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Query
 
 from ..db import get_connection, run_query
-from ..query_helpers import FULFILLED_STATUSES, period_filter
+from ..query_helpers import FULFILLED_STATUSES, period_filter, region_filter
 from ..schemas import MetricResponse, MetricRow
 
 router = APIRouter(prefix="/money", tags=["money"])
@@ -17,9 +17,10 @@ router = APIRouter(prefix="/money", tags=["money"])
 @router.get("/freight-cost-per-case", response_model=MetricResponse)
 def freight_cost_per_case(
     group_by: Literal["warehouse", "carrier"] = Query("warehouse"),
-    fiscal_year: Optional[int] = None,
+    fiscal_year: Optional[int] = Query(None, ge=2000, le=2100),
     fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
     month: Optional[str] = None,
+    region_code: Optional[str] = Query(None, description="Regional-manager scope, e.g. WST. Omit for all regions."),
     limit: int = Query(50, ge=1, le=500),
 ):
     freight_date_col = "f.invoice_date"
@@ -28,6 +29,14 @@ def freight_cost_per_case(
         fiscal_year, fiscal_quarter, month, freight_date_col
     )
     order_period_sql, order_params, _ = period_filter(fiscal_year, fiscal_quarter, month, order_date_col)
+
+    # Freight invoices don't carry a region of their own -- scoped via the
+    # delivering route's region (dim_route.region_id); order-side cases are
+    # scoped via the order's own region_id directly. Same "filtered
+    # independently, not line-by-line reconciled" caveat as the existing
+    # period filter above applies to the region filter too.
+    freight_region_sql, freight_region_params = region_filter(region_code, "rt.region_id")
+    order_region_sql, order_region_params = region_filter(region_code, "ol.region_id")
 
     if group_by == "warehouse":
         dim_select = "w.warehouse_code AS dim_code, w.warehouse_name AS dim_label"
@@ -49,14 +58,15 @@ def freight_cost_per_case(
                     SELECT {freight_group_col} AS dim_code, SUM(f.amount_inr) AS freight_inr
                     FROM fact_freight f
                     {freight_group_join}
-                    WHERE 1=1 {freight_period_sql}
+                    LEFT JOIN dim_route rt ON rt.route_id = f.route_id
+                    WHERE 1=1 {freight_period_sql} {freight_region_sql}
                     GROUP BY 1
                 ),
                 cases_agg AS (
                     SELECT {cases_group_col} AS dim_code, SUM(ol.delivered_cases) AS delivered_cases
                     FROM fact_order_lines ol
                     {cases_group_join}
-                    WHERE ol.order_status IN {FULFILLED_STATUSES} {order_period_sql}
+                    WHERE ol.order_status IN {FULFILLED_STATUSES} {order_period_sql} {order_region_sql}
                     GROUP BY 1
                 )
                 SELECT dm.warehouse_code AS dim_code, dm.warehouse_name AS dim_label,
@@ -68,12 +78,13 @@ def freight_cost_per_case(
                 ORDER BY freight_inr_per_case DESC
                 LIMIT ?
             """
-            rows = run_query(con, sql, freight_params + order_params + [limit])
+            rows = run_query(con, sql, freight_params + freight_region_params + order_params + order_region_params + [limit])
             caveats = [
                 "Freight invoice date and order date are both filtered to the same period independently "
                 "(invoices aren't individually linkable to a specific order in this API) -- "
                 "treat this as 'freight billed in period X' over 'cases delivered in period X', not a "
-                "line-by-line reconciliation.",
+                "line-by-line reconciliation. The region filter, when set, is applied the same "
+                "independent way: freight via the delivering route's region, cases via the order's own region.",
             ]
         else:
             sql = f"""
@@ -81,12 +92,13 @@ def freight_cost_per_case(
                        SUM(f.amount_inr) AS freight_inr, COUNT(*) AS n_invoices,
                        ROUND(AVG(f.amount_inr), 2) AS avg_invoice_inr
                 FROM fact_freight f
-                WHERE 1=1 {freight_period_sql}
+                LEFT JOIN dim_route rt ON rt.route_id = f.route_id
+                WHERE 1=1 {freight_period_sql} {freight_region_sql}
                 GROUP BY 1, 2
                 ORDER BY freight_inr DESC
                 LIMIT ?
             """
-            rows = run_query(con, sql, freight_params + [limit])
+            rows = run_query(con, sql, freight_params + freight_region_params + [limit])
             caveats = [
                 "Cost-per-delivered-case is not shown by carrier: freight invoices carry warehouse_code "
                 "and route_code but not an outlet/order-line-level key, so cases delivered can't be "
@@ -97,7 +109,7 @@ def freight_cost_per_case(
         metric="freight_cost_per_case" if group_by == "warehouse" else "freight_by_carrier",
         group_by=group_by,
         period_label=period_label,
-        filters_applied={"order_status_in": list(FULFILLED_STATUSES)} if group_by == "warehouse" else {},
+        filters_applied={"order_status_in": list(FULFILLED_STATUSES), "region_code": region_code} if group_by == "warehouse" else {"region_code": region_code},
         rows=[MetricRow(dimension=r["dim_code"], dimension_label=r["dim_label"],
                          metrics={k: v for k, v in r.items() if k not in ("dim_code", "dim_label")})
               for r in rows],
@@ -108,9 +120,10 @@ def freight_cost_per_case(
 @router.get("/returns-leakage", response_model=MetricResponse)
 def returns_leakage(
     group_by: Literal["category", "carrier"] = Query("category"),
-    fiscal_year: Optional[int] = None,
+    fiscal_year: Optional[int] = Query(None, ge=2000, le=2100),
     fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
     month: Optional[str] = None,
+    region_code: Optional[str] = Query(None, description="Regional-manager scope, e.g. WST. Omit for all regions."),
     limit: int = Query(50, ge=1, le=500),
 ):
     if group_by == "carrier":
@@ -126,6 +139,8 @@ def returns_leakage(
 
     ret_period_sql, ret_params, period_label = period_filter(fiscal_year, fiscal_quarter, month, "r.return_date")
     dispatch_period_sql, dispatch_params, _ = period_filter(fiscal_year, fiscal_quarter, month, "ol.order_date")
+    ret_region_sql, ret_region_params = region_filter(region_code, "r.region_id")
+    dispatch_region_sql, dispatch_region_params = region_filter(region_code, "ol.region_id")
 
     sql = f"""
         WITH returns_agg AS (
@@ -134,13 +149,13 @@ def returns_leakage(
                    COUNT(*) AS n_returns,
                    MODE(r.return_reason_code) AS leading_reason_code
             FROM fact_returns r
-            WHERE 1=1 {ret_period_sql}
+            WHERE 1=1 {ret_period_sql} {ret_region_sql}
             GROUP BY 1
         ),
         dispatch_agg AS (
             SELECT category, SUM(line_value_inr) AS dispatch_value_inr
             FROM fact_order_lines ol
-            WHERE order_status IN {FULFILLED_STATUSES} {dispatch_period_sql}
+            WHERE order_status IN {FULFILLED_STATUSES} {dispatch_period_sql} {dispatch_region_sql}
             GROUP BY 1
         )
         SELECT ra.category AS dim_code, ra.category AS dim_label,
@@ -153,13 +168,13 @@ def returns_leakage(
         LIMIT ?
     """
     with get_connection() as con:
-        rows = run_query(con, sql, ret_params + dispatch_params + [limit])
+        rows = run_query(con, sql, ret_params + ret_region_params + dispatch_params + dispatch_region_params + [limit])
 
     return MetricResponse(
         metric="returns_leakage",
         group_by=group_by,
         period_label=period_label,
-        filters_applied={"order_status_in": list(FULFILLED_STATUSES)},
+        filters_applied={"order_status_in": list(FULFILLED_STATUSES), "region_code": region_code},
         rows=[MetricRow(dimension=r["dim_code"], dimension_label=r["dim_label"],
                          metrics={k: v for k, v in r.items() if k not in ("dim_code", "dim_label")})
               for r in rows],

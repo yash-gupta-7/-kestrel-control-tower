@@ -24,6 +24,11 @@ class MetricResponse(BaseModel):
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=3, max_length=500)
+    region_code: Optional[str] = Field(
+        None, max_length=10,
+        description="Regional-manager scope selected in the UI, e.g. WST. Applied where the "
+                    "matched question's underlying data supports a region filter; ignored otherwise.",
+    )
 
 
 class AskResult(BaseModel):

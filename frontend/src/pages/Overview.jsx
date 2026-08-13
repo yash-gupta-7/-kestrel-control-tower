@@ -9,6 +9,7 @@ import { useApi } from "../lib/useApi";
 import { apiPost, buildQuery } from "../lib/api";
 import { lastCompleteFiscalQuarter, lastCompleteCalendarMonth, fiscalLabel } from "../lib/fiscal";
 import { formatINR, formatPct, formatNumber } from "../lib/format";
+import { useRegion } from "../lib/RegionContext";
 
 const lcq = lastCompleteFiscalQuarter();
 const lastMonth = lastCompleteCalendarMonth();
@@ -18,21 +19,24 @@ function sumBy(rows, key) {
 }
 
 export default function Overview() {
+  const { regionCode, regions } = useRegion();
+  const activeRegionName = regions.find((r) => r.region_code === regionCode)?.region_name;
+
   const worstOutlets = useApi(
     "/service/fill-rate" +
-      buildQuery({ group_by: "outlet", month: lastMonth, exclude_closed_outlets: true, limit: 5 }),
+      buildQuery({ group_by: "outlet", month: lastMonth, exclude_closed_outlets: true, region_code: regionCode, limit: 5 }),
   );
   const otifByRegion = useApi(
-    "/service/otif" + buildQuery({ group_by: "region", fiscal_year: lcq.fy, fiscal_quarter: lcq.fq, limit: 10 }),
+    "/service/otif" + buildQuery({ group_by: "region", fiscal_year: lcq.fy, fiscal_quarter: lcq.fq, region_code: regionCode, limit: 10 }),
   );
-  const fillByRegion = useApi("/service/fill-rate" + buildQuery({ group_by: "region", limit: 10, month: lastMonth }));
+  const fillByRegion = useApi("/service/fill-rate" + buildQuery({ group_by: "region", limit: 10, month: lastMonth, region_code: regionCode }));
   const returnsByCategory = useApi(
-    "/money/returns-leakage" + buildQuery({ group_by: "category", fiscal_year: lcq.fy, fiscal_quarter: lcq.fq, limit: 20 }),
+    "/money/returns-leakage" + buildQuery({ group_by: "category", fiscal_year: lcq.fy, fiscal_quarter: lcq.fq, region_code: regionCode, limit: 20 }),
   );
   const freightByWarehouse = useApi(
-    "/money/freight-cost-per-case" + buildQuery({ group_by: "warehouse", fiscal_year: lcq.fy, fiscal_quarter: lcq.fq, limit: 20 }),
+    "/money/freight-cost-per-case" + buildQuery({ group_by: "warehouse", fiscal_year: lcq.fy, fiscal_quarter: lcq.fq, region_code: regionCode, limit: 20 }),
   );
-  const findings = useSystemicFindings();
+  const findings = useSystemicFindings(regionCode);
 
   const overallFillRate = fillByRegion.data
     ? (100 * sumBy(fillByRegion.data.rows, "delivered_qty")) / sumBy(fillByRegion.data.rows, "ordered_qty")
@@ -58,6 +62,12 @@ export default function Overview() {
         <span className="text-faint" style={{ fontSize: 12 }}>
           {lcq.start} to {lcq.end}
         </span>
+        {activeRegionName && (
+          <>
+            {" "}
+            <Badge tone="accent">{activeRegionName} region only</Badge>
+          </>
+        )}
       </div>
 
       <Card className="mb-0" style={{ marginBottom: 18 }}>
@@ -166,7 +176,9 @@ export default function Overview() {
 
 function shortAnswer(text) {
   const cut = text.indexOf(". ");
-  return cut > 40 ? text.slice(0, text.indexOf(". ", cut + 1) + 1) : text;
+  if (cut <= 40) return text;
+  const end = text.indexOf(". ", cut + 1);
+  return text.slice(0, (end === -1 ? cut : end) + 1);
 }
 
 function weightedAvg(rows, valueKey, weightKey) {
@@ -208,13 +220,20 @@ function MoneySummary({ returnsData, freightData }) {
   );
 }
 
-function useSystemicFindings() {
+function useSystemicFindings(regionCode) {
   const [state, setState] = useState({ data: null, loading: true, error: null });
   useEffect(() => {
     let cancelled = false;
+    setState((s) => ({ ...s, loading: true }));
     Promise.all([
-      apiPost("/ask", { question: "Which routes are more than two hours late on more than one delivery in ten?" }),
-      apiPost("/ask", { question: "Which outlets ordered a discontinued SKU after its discontinuation date?" }),
+      apiPost("/ask", {
+        question: "Which routes are more than two hours late on more than one delivery in ten?",
+        region_code: regionCode || undefined,
+      }),
+      apiPost("/ask", {
+        question: "Which outlets ordered a discontinued SKU after its discontinuation date?",
+        region_code: regionCode || undefined,
+      }),
     ])
       .then(([lateRoutes, discontinued]) => {
         if (!cancelled) setState({ data: { lateRoutes, discontinued }, loading: false, error: null });
@@ -225,6 +244,6 @@ function useSystemicFindings() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [regionCode]);
   return state;
 }

@@ -10,9 +10,9 @@ const ICONS = {
 // (almost) every row in the population -- e.g. all 140 routes, all 724
 // outlets -- so the UI can say "this is a network-wide pattern" instead of
 // letting the number read as a broken query.
-export function Callout({ variant = "info", title, children }) {
+export function Callout({ variant = "info", title, children, style }) {
   return (
-    <div className={`callout callout-${variant}`}>
+    <div className={`callout callout-${variant}`} style={style}>
       <div className="callout-icon">{ICONS[variant] || ICONS.info}</div>
       <div>
         {title && <div className="callout-title">{title}</div>}

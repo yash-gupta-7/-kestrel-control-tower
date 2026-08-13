@@ -29,3 +29,25 @@ def period_filter(fiscal_year: Optional[int], fiscal_quarter: Optional[int], mon
     if fiscal_year is not None or fiscal_quarter is not None:
         raise HTTPException(400, "fiscal_year and fiscal_quarter must be given together")
     return "", [], "all available data (Jan 2025 - Jun 2026)"
+
+
+def region_filter(region_code: Optional[str], region_id_col: str) -> tuple[str, list]:
+    """Returns (sql_fragment, params) for the "regional manager view" scope
+    (see DECISIONS.md). This is a plain WHERE-clause filter, not
+    authentication/authorization -- anyone can switch region in the UI, it
+    just narrows what's shown, the same way a warehouse_code filter already
+    does elsewhere in this API.
+
+    region_code is looked up against dim_region by a scalar subquery rather
+    than validated here: an unknown code resolves to NULL, region_id_col =
+    NULL is false for every row, so the query returns an empty result set
+    (same graceful-empty behaviour as an unmatched warehouse_code filter)
+    instead of raising -- the frontend only ever offers codes it fetched
+    from GET /meta/regions, so this path is a safety net, not the primary
+    validation."""
+    if not region_code:
+        return "", []
+    return (
+        f"AND {region_id_col} = (SELECT region_id FROM dim_region WHERE region_code = ?)",
+        [region_code],
+    )

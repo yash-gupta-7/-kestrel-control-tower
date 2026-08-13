@@ -1,4 +1,5 @@
 import { NavLink, Outlet, useLocation } from "react-router-dom";
+import RegionSelector from "./RegionSelector";
 
 const NAV = [
   { to: "/", label: "Overview", weight: null, end: true },
@@ -54,6 +55,7 @@ export default function Layout() {
             <h1>{title}</h1>
             <div className="topbar-sub">{sub}</div>
           </div>
+          <RegionSelector />
         </div>
         <div className="page">
           <Outlet />

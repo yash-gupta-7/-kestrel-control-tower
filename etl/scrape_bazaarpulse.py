@@ -18,7 +18,14 @@ warning"), confirmed by inspection:
     <b class="sellingPrice">INR ...</b>. All four are handled per-card
     rather than assuming one applies per page or per city.
 
-Respects robots.txt: skips /internal/ and /admin/, honours Crawl-delay: 1.
+Robots.txt is fetched and parsed at the start of every run via Python's
+stdlib urllib.robotparser -- not hardcoded from a one-time manual read (an
+earlier version of this docstring claimed robots.txt compliance but the
+code never actually fetched it at runtime; found and fixed during an audit
+pass, see DECISIONS.md). Every URL this scraper requests is checked against
+the live policy with can_fetch() before the request is made, and the
+crawl-delay is read from the policy too (falling back to the hardcoded
+default only if robots.txt can't be fetched at all).
 
 Usage:
     python3 etl/scrape_bazaarpulse.py [--refresh]
@@ -35,12 +42,49 @@ import urllib.request
 import urllib.error
 from html import unescape
 from pathlib import Path
+from urllib.robotparser import RobotFileParser
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from etl import config
 
-CRAWL_DELAY_SECONDS = 1.0
+USER_AGENT = "kestrel-control-tower-scraper/1.0"
+DEFAULT_CRAWL_DELAY_SECONDS = 1.0  # used only if robots.txt is unreachable
 CITIES = ["mumbai", "delhi", "bengaluru", "chennai"]
+
+# Set once by main() via load_robots_policy(), read by fetch()/try_fetch().
+# Module-level rather than threaded through every call site, since it's a
+# single run-wide policy, not per-request state.
+_ROBOTS: RobotFileParser | None = None
+CRAWL_DELAY_SECONDS = DEFAULT_CRAWL_DELAY_SECONDS
+
+
+def load_robots_policy() -> RobotFileParser | None:
+    """Fetches and parses robots.txt from the scrape target. Returns None
+    if it can't be fetched at all (network error, not just a 404 -- a 404
+    is a valid "no restrictions" answer that RobotFileParser already
+    handles correctly), in which case callers fall back to the documented
+    disallow list as a conservative default rather than assuming
+    everything is fair game."""
+    rp = RobotFileParser()
+    rp.set_url(f"{config.BAZAARPULSE_BASE_URL}/robots.txt")
+    try:
+        rp.read()
+    except Exception as e:
+        print(f"  Could not fetch robots.txt ({e}) -- falling back to the last-known "
+              f"policy (Crawl-delay: {DEFAULT_CRAWL_DELAY_SECONDS}, Disallow: /internal/, /admin/).")
+        return None
+    return rp
+
+
+def _robots_allowed(url: str) -> bool:
+    if _ROBOTS is not None:
+        return _ROBOTS.can_fetch(USER_AGENT, url)
+    # No policy fetched -- fall back to the specific rules this scraper has
+    # always been built around (see module docstring), rather than either
+    # blocking everything or allowing everything by default.
+    from urllib.parse import urlparse
+    path = urlparse(url).path
+    return not (path.startswith("/internal/") or path.startswith("/admin/"))
 
 CARD_START_RE = re.compile(r'<div class="card product-item" data-listing-id="(\d+)">')
 PAGE_COUNT_RE = re.compile(r"page \d+ of (\d+)", re.IGNORECASE)
@@ -56,8 +100,14 @@ MRP_STOCK_RE = re.compile(r'<div class="muted">(MRP.*?)</div>')
 LAST_SEEN_RE = re.compile(r'Last seen: ([\d-]+)')
 
 
+class RobotsDisallowedError(Exception):
+    pass
+
+
 def fetch(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "kestrel-control-tower-scraper/1.0"})
+    if not _robots_allowed(url):
+        raise RobotsDisallowedError(f"robots.txt disallows fetching {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=10) as resp:
         return resp.read().decode("utf-8")
 
@@ -66,6 +116,9 @@ def try_fetch(url: str) -> str | None:
     try:
         return fetch(url)
     except (urllib.error.HTTPError, urllib.error.URLError):
+        return None
+    except RobotsDisallowedError as e:
+        print(f"    skipping (robots.txt): {e}")
         return None
 
 
@@ -239,6 +292,8 @@ def scrape_city(city: str) -> list[dict]:
 
 
 def main():
+    global _ROBOTS, CRAWL_DELAY_SECONDS
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--refresh", action="store_true", help="Re-scrape even if a cache file exists")
     args = parser.parse_args()
@@ -249,6 +304,14 @@ def main():
     if out_path.exists() and not args.refresh:
         print(f"Cache exists at {out_path}, skipping (use --refresh to re-scrape).")
         return
+
+    _ROBOTS = load_robots_policy()
+    if _ROBOTS is not None:
+        policy_delay = _ROBOTS.crawl_delay(USER_AGENT)
+        if policy_delay:
+            CRAWL_DELAY_SECONDS = float(policy_delay)
+        print(f"  robots.txt loaded: crawl-delay {CRAWL_DELAY_SECONDS}s, "
+              f"can_fetch a /city/ URL = {_ROBOTS.can_fetch(USER_AGENT, f'{config.BAZAARPULSE_BASE_URL}/city/mumbai/page/1.html')}")
 
     all_rows = []
     for city in CITIES:

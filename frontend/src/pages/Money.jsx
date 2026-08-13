@@ -8,19 +8,21 @@ import { useApi } from "../lib/useApi";
 import { apiPost, buildQuery } from "../lib/api";
 import { lastCompleteFiscalQuarter } from "../lib/fiscal";
 import { formatINR, formatPct, formatNumber } from "../lib/format";
+import { useRegion } from "../lib/RegionContext";
 
 const lcq = lastCompleteFiscalQuarter();
 
 export default function Money() {
   const [period, setPeriod] = useState({ fiscal_year: lcq.fy, fiscal_quarter: lcq.fq });
   const [freightGroupBy, setFreightGroupBy] = useState("warehouse");
+  const { regionCode } = useRegion();
 
-  const freightPath = "/money/freight-cost-per-case" + buildQuery({ group_by: freightGroupBy, limit: 15, ...period });
-  const returnsPath = "/money/returns-leakage" + buildQuery({ group_by: "category", limit: 15, ...period });
+  const freightPath = "/money/freight-cost-per-case" + buildQuery({ group_by: freightGroupBy, limit: 15, region_code: regionCode, ...period });
+  const returnsPath = "/money/returns-leakage" + buildQuery({ group_by: "category", limit: 15, region_code: regionCode, ...period });
 
   const freight = useApi(freightPath);
   const returns = useApi(returnsPath);
-  const discontinued = useDiscontinuedFinding();
+  const discontinued = useDiscontinuedFinding(regionCode);
 
   return (
     <div>
@@ -152,11 +154,15 @@ export default function Money() {
   );
 }
 
-function useDiscontinuedFinding() {
+function useDiscontinuedFinding(regionCode) {
   const [state, setState] = useState({ data: null, loading: true, error: null });
   useEffect(() => {
     let cancelled = false;
-    apiPost("/ask", { question: "Which outlets ordered a discontinued SKU after its discontinuation date?" })
+    setState((s) => ({ ...s, loading: true }));
+    apiPost("/ask", {
+      question: "Which outlets ordered a discontinued SKU after its discontinuation date?",
+      region_code: regionCode || undefined,
+    })
       .then((data) => {
         if (!cancelled) setState({ data, loading: false, error: null });
       })
@@ -166,6 +172,6 @@ function useDiscontinuedFinding() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [regionCode]);
   return state;
 }

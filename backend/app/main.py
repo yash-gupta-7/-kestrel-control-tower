@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import config
-from .routers import ask, cold_chain, health, money, price_position, service
+from .routers import ask, cold_chain, health, meta, money, price_position, service
 
 app = FastAPI(
     title="Kestrel Control Tower API",
@@ -27,3 +27,4 @@ app.include_router(money.router)
 app.include_router(cold_chain.router)
 app.include_router(price_position.router)
 app.include_router(ask.router)
+app.include_router(meta.router)

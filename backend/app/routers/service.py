@@ -30,7 +30,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Query
 
 from ..db import data_max_order_date, get_connection, run_query
-from ..query_helpers import FULFILLED_STATUSES, period_filter
+from ..query_helpers import FULFILLED_STATUSES, period_filter, region_filter
 from ..schemas import MetricResponse, MetricRow
 
 router = APIRouter(prefix="/service", tags=["service"])
@@ -48,9 +48,10 @@ _DIM_CONFIG = {
 @router.get("/fill-rate", response_model=MetricResponse)
 def fill_rate(
     group_by: GroupBy = Query("outlet"),
-    fiscal_year: Optional[int] = None,
+    fiscal_year: Optional[int] = Query(None, ge=2000, le=2100),
     fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
     month: Optional[str] = Query(None, description="YYYY-MM, overrides fiscal_year/quarter if given"),
+    region_code: Optional[str] = Query(None, description="Regional-manager scope, e.g. WST. Omit for all regions."),
     exclude_test_outlets: bool = True,
     exclude_closed_outlets: bool = False,
     exclude_deleted_outlets: bool = True,
@@ -71,6 +72,11 @@ def fill_rate(
         # wasn't exercised in the Phase 3 checkpoint.
         where_clauses.append(period_sql.removeprefix("AND "))
         params += period_params
+
+    region_sql, region_params = region_filter(region_code, "ol.region_id")
+    if region_sql:
+        where_clauses.append(region_sql.removeprefix("AND "))
+        params += region_params
 
     outlet_join = ""
     if group_by == "outlet" or exclude_test_outlets or exclude_closed_outlets or exclude_deleted_outlets:
@@ -118,6 +124,7 @@ def fill_rate(
             exclude_closed_outlets=exclude_closed_outlets,
             exclude_deleted_outlets=exclude_deleted_outlets,
             order_status_in=list(FULFILLED_STATUSES),
+            region_code=region_code,
         ),
         rows=[
             MetricRow(
@@ -140,17 +147,24 @@ def fill_rate(
 
 @router.get("/otif", response_model=MetricResponse)
 def otif(
-    group_by: Literal["region", "warehouse", "route"] = Query("region"),
-    fiscal_year: Optional[int] = None,
+    group_by: Literal["region", "warehouse", "route", "outlet"] = Query("region"),
+    fiscal_year: Optional[int] = Query(None, ge=2000, le=2100),
     fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
     month: Optional[str] = None,
+    region_code: Optional[str] = Query(None, description="Regional-manager scope, e.g. WST. Omit for all regions."),
     on_time_threshold_minutes: int = Query(0, description="delay_minutes <= this counts as on-time"),
     order: Literal["asc", "desc"] = Query("asc"),
     limit: int = Query(50, ge=1, le=500),
 ):
+    # group_by=outlet added for parity with fill_rate (both were asked for
+    # "by region, by warehouse, by route, by outlet" in the brief); uses
+    # the same dim_outlet entry already shared with fill_rate's
+    # _DIM_CONFIG. No change to the OTIF business definition below.
     cfg = _DIM_CONFIG[group_by]
     period_sql, period_params, period_label = period_filter(fiscal_year, fiscal_quarter, month, "oa.order_date")
     where_extra = period_sql or "AND 1=1"
+
+    region_sql, region_params = region_filter(region_code, "d.region_id")
 
     sql = f"""
         WITH order_agg AS (
@@ -162,7 +176,7 @@ def otif(
             GROUP BY order_id
         ),
         otif_base AS (
-            SELECT d.delivery_id, d.region_id, d.warehouse_id, d.route_id,
+            SELECT d.delivery_id, d.region_id, d.warehouse_id, d.route_id, d.outlet_id,
                    (d.delay_minutes <= ?) AS is_on_time,
                    -- Strict, textbook in-full: no tolerance. See module
                    -- docstring and DECISIONS.md -- this is close to 0%
@@ -172,7 +186,7 @@ def otif(
                    (100.0 * oa.delivered_eaches / NULLIF(oa.ordered_eaches, 0)) AS fulfilment_pct
             FROM fact_deliveries d
             JOIN order_agg oa ON oa.order_id = d.order_id
-            WHERE 1=1 {where_extra}
+            WHERE 1=1 {where_extra} {region_sql}
         )
         SELECT dm.{cfg['code_col']} AS dim_code, dm.{cfg['label_col']} AS dim_label,
                COUNT(*) AS n_deliveries,
@@ -188,7 +202,7 @@ def otif(
         LIMIT ?
     """
     with get_connection() as con:
-        rows = run_query(con, sql, [on_time_threshold_minutes] + period_params + [limit])
+        rows = run_query(con, sql, [on_time_threshold_minutes] + period_params + region_params + [limit])
 
     return MetricResponse(
         metric="otif",
@@ -196,7 +210,8 @@ def otif(
         period_label=period_label,
         filters_applied={"on_time_threshold_minutes": on_time_threshold_minutes,
                           "in_full_definition": "strict: delivered_eaches >= ordered_eaches, no tolerance",
-                          "order_status_in": list(FULFILLED_STATUSES)},
+                          "order_status_in": list(FULFILLED_STATUSES),
+                          "region_code": region_code},
         rows=[
             MetricRow(
                 dimension=r["dim_code"], dimension_label=r["dim_label"],

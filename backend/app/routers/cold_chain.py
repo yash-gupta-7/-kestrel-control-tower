@@ -7,13 +7,13 @@ Scoped deliberately light (10% of build priority per plan) but covers all
 three things Divya's brief item 2 names: excursions, near-expiry stock,
 and cold-chain-caused returns.
 """
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Query
 
 from ..db import get_connection, run_query
 from ..schemas import MetricResponse, MetricRow
-from ..query_helpers import period_filter
+from ..query_helpers import period_filter, region_filter
 
 router = APIRouter(prefix="/cold-chain", tags=["cold-chain"])
 
@@ -21,9 +21,14 @@ COLD_CHAIN_REASON_CODES = ("RT01_NEAR_EXPIRY", "RT06_COLD_CHAIN_BREACH")
 
 
 @router.get("/excursions", response_model=MetricResponse)
-def excursions(fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
-               month: Optional[str] = None):
+def excursions(
+    fiscal_year: Optional[int] = Query(None, ge=2000, le=2100),
+    fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
+    month: Optional[str] = None,
+    region_code: Optional[str] = Query(None, description="Regional-manager scope, e.g. WST. Omit for all regions."),
+):
     period_sql, params, period_label = period_filter(fiscal_year, fiscal_quarter, month, "d.dispatch_datetime")
+    region_sql, region_params = region_filter(region_code, "d.region_id")
 
     sql = f"""
         WITH chilled_orders AS (
@@ -35,7 +40,7 @@ def excursions(fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] 
                    d.temperature_excursion_flag
             FROM fact_deliveries d
             JOIN chilled_orders c ON c.order_id = d.order_id
-            WHERE 1=1 {period_sql}
+            WHERE 1=1 {period_sql} {region_sql}
         )
         SELECT month AS dim_code, month AS dim_label,
                COUNT(*) AS chilled_deliveries,
@@ -47,12 +52,13 @@ def excursions(fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] 
         ORDER BY 1
     """
     with get_connection() as con:
-        rows = run_query(con, sql, params)
+        rows = run_query(con, sql, params + region_params)
 
     return MetricResponse(
         metric="temperature_excursions_per_hundred_chilled_deliveries",
         group_by="month",
         period_label=period_label,
+        filters_applied={"region_code": region_code},
         rows=[MetricRow(dimension=r["dim_code"], dimension_label=r["dim_label"],
                          metrics={k: v for k, v in r.items() if k not in ("dim_code", "dim_label")})
               for r in rows],
@@ -65,9 +71,15 @@ def excursions(fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] 
 
 
 @router.get("/returns", response_model=MetricResponse)
-def cold_chain_returns(fiscal_year: Optional[int] = None, fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
-                        month: Optional[str] = None, limit: int = 50):
+def cold_chain_returns(
+    fiscal_year: Optional[int] = Query(None, ge=2000, le=2100),
+    fiscal_quarter: Optional[int] = Query(None, ge=1, le=4),
+    month: Optional[str] = None,
+    region_code: Optional[str] = Query(None, description="Regional-manager scope, e.g. WST. Omit for all regions."),
+    limit: int = 50,
+):
     period_sql, params, period_label = period_filter(fiscal_year, fiscal_quarter, month, "return_date")
+    region_sql, region_params = region_filter(region_code, "region_id")
     reason_list = ", ".join(f"'{r}'" for r in COLD_CHAIN_REASON_CODES)
 
     sql = f"""
@@ -76,19 +88,19 @@ def cold_chain_returns(fiscal_year: Optional[int] = None, fiscal_quarter: Option
                SUM(credit_note_value_inr) AS return_value_inr,
                COUNT(*) AS n_returns
         FROM fact_returns
-        WHERE return_reason_code IN ({reason_list}) {period_sql}
+        WHERE return_reason_code IN ({reason_list}) {period_sql} {region_sql}
         GROUP BY 1, 2, 3
         ORDER BY return_value_inr DESC
         LIMIT ?
     """
     with get_connection() as con:
-        rows = run_query(con, sql, params + [limit])
+        rows = run_query(con, sql, params + region_params + [limit])
 
     return MetricResponse(
         metric="cold_chain_returns",
         group_by="category_and_reason",
         period_label=period_label,
-        filters_applied={"return_reason_code_in": list(COLD_CHAIN_REASON_CODES)},
+        filters_applied={"return_reason_code_in": list(COLD_CHAIN_REASON_CODES), "region_code": region_code},
         rows=[MetricRow(dimension=r["dim_code"], dimension_label=r["dim_label"],
                          metrics={k: v for k, v in r.items() if k not in ("dim_code", "dim_label")})
               for r in rows],
@@ -101,23 +113,28 @@ def cold_chain_returns(fiscal_year: Optional[int] = None, fiscal_quarter: Option
 
 @router.get("/near-expiry", response_model=MetricResponse)
 def near_expiry(
-    group_by: str = "category",
-    near_expiry_days: int = 30,
+    group_by: Literal["category", "warehouse"] = Query("category"),
+    near_expiry_days: int = Query(30, ge=1, le=365),
     warehouse_code: Optional[str] = None,
+    region_code: Optional[str] = Query(None, description="Regional-manager scope, e.g. WST. Omit for all regions."),
 ):
     """Stock expiring within `near_expiry_days` of the LATEST inventory
     snapshot (this is a point-in-time stock position, not a period metric --
     there is exactly one 'now' for on-hand stock, unlike orders/deliveries
-    which accumulate over a date range)."""
-    if group_by not in ("category", "warehouse"):
-        group_by = "category"
-    needs_warehouse_join = group_by == "warehouse" or warehouse_code is not None
+    which accumulate over a date range).
+
+    group_by is a Pydantic Literal (invalid values -> 422), consistent with
+    every other endpoint's group_by contract -- this used to silently fall
+    back to 'category' on bad input instead of rejecting it; fixed as part
+    of the same audit pass that added the region filter below."""
+    needs_warehouse_join = group_by == "warehouse" or warehouse_code is not None or region_code is not None
     dim_select = (
         "s.category AS dim_code, s.category AS dim_label" if group_by == "category"
         else "w.warehouse_code AS dim_code, w.warehouse_name AS dim_label"
     )
     dim_join = "JOIN dim_warehouse w ON w.warehouse_id = s.warehouse_id" if needs_warehouse_join else ""
     warehouse_filter = "AND w.warehouse_code = ?" if warehouse_code else ""
+    region_sql, region_params = region_filter(region_code, "w.region_id") if needs_warehouse_join else ("", [])
 
     sql = f"""
         WITH latest AS (SELECT MAX(snapshot_date) AS d FROM fact_inventory_snapshot)
@@ -128,13 +145,13 @@ def near_expiry(
                      / NULLIF(SUM(s.on_hand_cases), 0), 1) AS near_expiry_pct
         FROM fact_inventory_snapshot s
         {dim_join}
-        WHERE s.snapshot_date = (SELECT d FROM latest) {warehouse_filter}
+        WHERE s.snapshot_date = (SELECT d FROM latest) {warehouse_filter} {region_sql}
         GROUP BY 1, 2
         ORDER BY near_expiry_pct DESC
     """
     # near_expiry_days is bound twice (near_expiry_cases, near_expiry_pct);
-    # warehouse_code, if given, is bound once more for the filter clause.
-    params = [near_expiry_days, near_expiry_days] + ([warehouse_code] if warehouse_code else [])
+    # warehouse_code and region_code, if given, are bound after that.
+    params = [near_expiry_days, near_expiry_days] + ([warehouse_code] if warehouse_code else []) + region_params
     with get_connection() as con:
         as_of = con.execute("SELECT MAX(snapshot_date) FROM fact_inventory_snapshot").fetchone()[0]
         rows = run_query(con, sql, params)
@@ -143,7 +160,7 @@ def near_expiry(
         metric="near_expiry_stock",
         group_by=group_by,
         period_label=f"as of latest snapshot ({as_of})",
-        filters_applied={"near_expiry_days": near_expiry_days, "warehouse_code": warehouse_code},
+        filters_applied={"near_expiry_days": near_expiry_days, "warehouse_code": warehouse_code, "region_code": region_code},
         rows=[MetricRow(dimension=r["dim_code"], dimension_label=r["dim_label"],
                          metrics={k: v for k, v in r.items() if k not in ("dim_code", "dim_label")})
               for r in rows],

@@ -4,6 +4,7 @@ import { CaveatList } from "../components/Callout";
 import { LoadingBlock } from "../components/States";
 import { useApi } from "../lib/useApi";
 import { apiPost } from "../lib/api";
+import { useRegion } from "../lib/RegionContext";
 
 const MODE_LABEL = {
   fast_path: "Answered",
@@ -79,6 +80,8 @@ export default function AskAnything() {
   const [history, setHistory] = useState([]);
   const [asking, setAsking] = useState(false);
   const suggested = useApi("/ask/supported-questions");
+  const { regionCode, regions } = useRegion();
+  const activeRegionName = regions.find((r) => r.region_code === regionCode)?.region_name;
 
   async function ask(q) {
     const text = (q ?? question).trim();
@@ -86,7 +89,7 @@ export default function AskAnything() {
     setAsking(true);
     setQuestion("");
     try {
-      const result = await apiPost("/ask", { question: text });
+      const result = await apiPost("/ask", { question: text, region_code: regionCode || undefined });
       setHistory((h) => [result, ...h]);
     } catch (e) {
       setHistory((h) => [
@@ -120,6 +123,12 @@ export default function AskAnything() {
             {asking ? "Asking…" : "Ask"}
           </button>
         </div>
+        {activeRegionName && (
+          <div className="text-faint" style={{ marginTop: 8, fontSize: 12 }}>
+            Scoped to <strong>{activeRegionName}</strong> region where the question supports it (see the
+            region selector, top right).
+          </div>
+        )}
         <div style={{ marginTop: 12 }}>
           <div className="control-label" style={{ marginBottom: 8, display: "block" }}>
             Questions this build answers deterministically

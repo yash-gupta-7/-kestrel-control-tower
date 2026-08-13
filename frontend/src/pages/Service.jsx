@@ -8,6 +8,7 @@ import { useApi } from "../lib/useApi";
 import { apiPost, buildQuery } from "../lib/api";
 import { lastCompleteFiscalQuarter, fiscalLabel } from "../lib/fiscal";
 import { formatPct, formatNumber } from "../lib/format";
+import { useRegion } from "../lib/RegionContext";
 
 const lcq = lastCompleteFiscalQuarter();
 
@@ -22,13 +23,14 @@ export default function Service() {
   const [period, setPeriod] = useState({ fiscal_year: lcq.fy, fiscal_quarter: lcq.fq });
   const [fillGroupBy, setFillGroupBy] = useState("outlet");
   const [otifGroupBy, setOtifGroupBy] = useState("region");
+  const { regionCode } = useRegion();
 
-  const fillPath = "/service/fill-rate" + buildQuery({ group_by: fillGroupBy, limit: 15, ...period });
-  const otifPath = "/service/otif" + buildQuery({ group_by: otifGroupBy, limit: 15, ...period });
+  const fillPath = "/service/fill-rate" + buildQuery({ group_by: fillGroupBy, limit: 15, region_code: regionCode, ...period });
+  const otifPath = "/service/otif" + buildQuery({ group_by: otifGroupBy, limit: 15, region_code: regionCode, ...period });
 
   const fillRate = useApi(fillPath);
   const otif = useApi(otifPath);
-  const lateRoutes = useLateRoutesFinding();
+  const lateRoutes = useLateRoutesFinding(regionCode);
 
   return (
     <div>
@@ -87,6 +89,7 @@ export default function Service() {
               <option value="region">By region</option>
               <option value="warehouse">By warehouse</option>
               <option value="route">By route</option>
+              <option value="outlet">By outlet</option>
             </select>
           }
         >
@@ -172,11 +175,15 @@ export default function Service() {
   );
 }
 
-function useLateRoutesFinding() {
+function useLateRoutesFinding(regionCode) {
   const [state, setState] = useState({ data: null, loading: true, error: null });
   useEffect(() => {
     let cancelled = false;
-    apiPost("/ask", { question: "Which routes are more than two hours late on more than one delivery in ten?" })
+    setState((s) => ({ ...s, loading: true }));
+    apiPost("/ask", {
+      question: "Which routes are more than two hours late on more than one delivery in ten?",
+      region_code: regionCode || undefined,
+    })
       .then((data) => {
         if (!cancelled) setState({ data, loading: false, error: null });
       })
@@ -186,6 +193,6 @@ function useLateRoutesFinding() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [regionCode]);
   return state;
 }

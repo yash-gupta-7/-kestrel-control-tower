@@ -6,13 +6,15 @@ import { CaveatList } from "../components/Callout";
 import { useApi } from "../lib/useApi";
 import { buildQuery } from "../lib/api";
 import { formatPct, formatNumber, formatINR } from "../lib/format";
+import { useRegion } from "../lib/RegionContext";
 
 export default function ColdChain() {
   const [nearExpiryGroupBy, setNearExpiryGroupBy] = useState("category");
+  const { regionCode } = useRegion();
 
-  const excursions = useApi("/cold-chain/excursions");
-  const nearExpiry = useApi("/cold-chain/near-expiry" + buildQuery({ group_by: nearExpiryGroupBy }));
-  const returns = useApi("/cold-chain/returns");
+  const excursions = useApi("/cold-chain/excursions" + buildQuery({ region_code: regionCode }));
+  const nearExpiry = useApi("/cold-chain/near-expiry" + buildQuery({ group_by: nearExpiryGroupBy, region_code: regionCode }));
+  const returns = useApi("/cold-chain/returns" + buildQuery({ region_code: regionCode }));
 
   const maxExcursion = excursions.data
     ? Math.max(...excursions.data.rows.map((r) => r.metrics.excursions_per_hundred), 1)

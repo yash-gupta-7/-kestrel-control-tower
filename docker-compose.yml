@@ -3,15 +3,32 @@ name: kestrel-control-tower
 # Requires ASSIGNMENT_PACK_DIR pointing at the unzipped FDE assignment pack
 # (the folder containing data/kestrel_ops.db, bazaarpulse_site/,
 # partner_api/). Copy .env.example to .env and set it there. None of that
-# data is in this repo -- see README and DECISIONS.md.
+# data is committed to this repo -- see README and DECISIONS.md.
+#
+# ASSIGNMENT_PACK_DIR is used two different ways below, on purpose:
+#   - data/ (95MB DB + CSVs) is read live by the etl container via a
+#     runtime bind mount -- it's too large to bake into an image sensibly.
+#   - bazaarpulse_site/ and partner_api/ are small, static fixtures baked
+#     into their images at BUILD time via `additional_contexts`, not
+#     mounted at runtime. Build-context transfer is a one-shot file read
+#     by the Docker CLI, not a live bind mount, so it isn't subject to
+#     Docker Desktop's File Sharing allow-list the way `volumes:` is --
+#     this is what actually broke on first real Docker Desktop test (see
+#     DECISIONS.md for the root cause and why this is the fix, not a
+#     workaround).
+#
+# The `${ASSIGNMENT_PACK_DIR:?...}` syntax below means Compose refuses to
+# start with a clear error if the variable is unset or empty, instead of
+# silently substituting an empty string (which is exactly what produced
+# the bogus `/partner_api` absolute-path mount in the original bug).
 
 services:
   bazaarpulse:
-    image: python:3.11-slim
-    working_dir: /site
-    volumes:
-      - ${ASSIGNMENT_PACK_DIR}/bazaarpulse_site:/site:ro
-    command: python3 -m http.server 8080
+    build:
+      context: .
+      dockerfile: docker/bazaarpulse.Dockerfile
+      additional_contexts:
+        site: "${ASSIGNMENT_PACK_DIR:?Set ASSIGNMENT_PACK_DIR in .env to your unzipped assignment pack path -- see README}/bazaarpulse_site"
     ports:
       - "8080:8080"
     healthcheck:
@@ -24,9 +41,8 @@ services:
     build:
       context: .
       dockerfile: docker/partner-api.Dockerfile
-    working_dir: /app
-    volumes:
-      - ${ASSIGNMENT_PACK_DIR}/partner_api:/app:ro
+      additional_contexts:
+        pack: "${ASSIGNMENT_PACK_DIR:?Set ASSIGNMENT_PACK_DIR in .env to your unzipped assignment pack path -- see README}/partner_api"
     ports:
       - "8088:8088"
     healthcheck:
@@ -45,7 +61,7 @@ services:
       partner-api:
         condition: service_healthy
     volumes:
-      - ${ASSIGNMENT_PACK_DIR}/data:/data:ro
+      - "${ASSIGNMENT_PACK_DIR:?Set ASSIGNMENT_PACK_DIR in .env to your unzipped assignment pack path -- see README}/data:/data:ro"
       - warehouse_data:/app/warehouse
       - cache_data:/app/cache
     environment:

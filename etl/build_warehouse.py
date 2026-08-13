@@ -245,11 +245,16 @@ def build_fact_deliveries(con):
 
 
 def build_fact_returns(con):
+    # region_id is added via dim_outlet (not present on the raw table) so
+    # returns can be scoped by region the same way fact_order_lines and
+    # fact_deliveries already are -- additive only, no change to any
+    # existing column or cleaning rule.
     con.execute("""
         CREATE OR REPLACE TABLE fact_returns AS
         SELECT
             r.return_id, r.credit_note_number, r.order_id, r.order_line_id,
-            r.outlet_id, r.product_id,
+            r.outlet_id, o.region_id,
+            r.product_id,
             CAST(r.return_date AS DATE) AS return_date,
             ABS(r.return_qty) AS return_qty,  -- KP-2402: sign is a known bug, not signal
             r.qty_uom,
@@ -260,6 +265,7 @@ def build_fact_returns(con):
         FROM raw.returns_credit_notes r
         LEFT JOIN raw.order_lines ol ON ol.order_line_id = r.order_line_id
         JOIN dim_product p ON p.product_id = r.product_id
+        JOIN dim_outlet o ON o.outlet_id = r.outlet_id
     """)
 
 

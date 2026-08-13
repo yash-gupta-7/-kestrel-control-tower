@@ -5,6 +5,7 @@ import { Callout, CaveatList } from "../components/Callout";
 import { useApi } from "../lib/useApi";
 import { buildQuery } from "../lib/api";
 import { formatINR, formatPct, formatNumber } from "../lib/format";
+import { useRegion } from "../lib/RegionContext";
 
 const CITIES = [
   { value: "mumbai", label: "Mumbai" },
@@ -15,6 +16,8 @@ const CITIES = [
 
 export default function PricePosition() {
   const [city, setCity] = useState("mumbai");
+  const { regionCode, regions } = useRegion();
+  const activeRegionName = regions.find((r) => r.region_code === regionCode)?.region_name;
 
   const gap = useApi("/price-position/gap" + buildQuery({ city, top_n_skus_by_value: 20 }));
   const summary = useApi("/price-position/summary" + buildQuery({ city }));
@@ -30,6 +33,15 @@ export default function PricePosition() {
         <strong>no confident match</strong> rather than guessed. Across all 4 cities, 614 of 1,137 scraped
         listings (54%) match with confidence.
       </Callout>
+
+      {activeRegionName && (
+        <Callout variant="warn" title="Region selector doesn't apply on this page" style={{ marginTop: 12 }}>
+          You have <strong>{activeRegionName}</strong> selected, but competitor listings are scraped by{" "}
+          <strong>city</strong> (Mumbai/Delhi/Bengaluru/Chennai), not by Kestrel's own sales regions, and
+          the two aren't mapped in this dataset. This page always shows all cities regardless of the
+          region selector — use the city picker below instead.
+        </Callout>
+      )}
 
       <div className="controls-row" style={{ marginTop: 16 }}>
         <span className="control-label">City</span>

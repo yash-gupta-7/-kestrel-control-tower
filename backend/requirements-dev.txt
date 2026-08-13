@@ -1,0 +1,5 @@
+# Test-only dependencies. Not installed in any Docker image (see
+# backend/Dockerfile) -- production containers don't need pytest.
+-r requirements.txt
+pytest==8.3.4
+httpx==0.28.1
