@@ -9,8 +9,9 @@ import { useRegion } from "../lib/RegionContext";
 const MODE_LABEL = {
   fast_path: "Answered",
   llm: "Answered (AI)",
-  llm_not_implemented: "AI not yet implemented",
+  llm_error: "AI answer unavailable",
   unavailable: "AI unavailable",
+  blocked: "Not available",
 };
 
 function GenericDataTable({ rows }) {

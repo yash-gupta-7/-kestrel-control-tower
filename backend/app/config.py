@@ -17,6 +17,8 @@ from etl import config as etl_config  # noqa: E402
 WAREHOUSE_DB_PATH = etl_config.WAREHOUSE_DB_PATH
 ANTHROPIC_API_KEY = etl_config.ANTHROPIC_API_KEY
 ANTHROPIC_MODEL = etl_config.ANTHROPIC_MODEL
+GROQ_API_KEY = etl_config.GROQ_API_KEY
+GROQ_MODEL = etl_config.GROQ_MODEL
 
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
 

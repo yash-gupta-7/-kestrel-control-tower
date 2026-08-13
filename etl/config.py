@@ -29,8 +29,14 @@ WEATHER_START_DATE = os.environ.get("WEATHER_START_DATE", "2025-01-01")
 WEATHER_END_DATE = os.environ.get("WEATHER_END_DATE", "2026-06-30")
 
 # --- LLM (optional; ask-anything degrades gracefully without it) -----------
+# GROQ_API_KEY is the active free-form Ask Anything path (see
+# backend/app/routers/ask.py). ANTHROPIC_API_KEY/ANTHROPIC_MODEL are kept for
+# backward compatibility with earlier docs/config but are not called by any
+# code path today.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 # --- Local storage -----------------------------------------------------------
 APP_ROOT = Path(__file__).resolve().parent.parent

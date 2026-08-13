@@ -718,10 +718,17 @@ table.dt th.num {
   background: var(--color-good-bg);
   color: var(--color-good);
 }
-.mode-badge-unavailable,
-.mode-badge-llm_not_implemented {
+.mode-badge-unavailable {
   background: var(--color-neutral-bg);
   color: var(--color-text-muted);
+}
+.mode-badge-llm_error {
+  background: var(--color-warn-bg);
+  color: var(--color-warn);
+}
+.mode-badge-blocked {
+  background: var(--color-bad-bg);
+  color: var(--color-bad);
 }
 
 .text-muted {

@@ -15,7 +15,7 @@ def health():
             warehouse_found=False,
             warehouse_path=str(config.WAREHOUSE_DB_PATH),
             tables=[],
-            llm_configured=bool(config.ANTHROPIC_API_KEY),
+            llm_configured=bool(config.GROQ_API_KEY),
         )
     with get_connection() as con:
         tables = [r[0] for r in con.execute("SHOW TABLES").fetchall()]
@@ -24,5 +24,5 @@ def health():
         warehouse_found=True,
         warehouse_path=str(config.WAREHOUSE_DB_PATH),
         tables=sorted(tables),
-        llm_configured=bool(config.ANTHROPIC_API_KEY),
+        llm_configured=bool(config.GROQ_API_KEY),
     )

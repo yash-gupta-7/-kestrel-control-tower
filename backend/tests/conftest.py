@@ -35,6 +35,11 @@ WAREHOUSE_PATH = REPO_ROOT / "warehouse" / "warehouse.duckdb"
 if WAREHOUSE_PATH.exists():
     os.environ["WAREHOUSE_DB_PATH"] = str(WAREHOUSE_PATH)
 os.environ.setdefault("ANTHROPIC_API_KEY", "")
+# Force-cleared (not setdefault) so a real key set in the host/container's
+# .env for actually running the app never leaks into the test session and
+# makes tests silently start hitting the real Groq API -- tests that need a
+# "configured" GROQ_API_KEY use monkeypatch + a mocked Groq client instead.
+os.environ["GROQ_API_KEY"] = ""
 
 
 @pytest.fixture(scope="session")

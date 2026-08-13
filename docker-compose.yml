@@ -84,6 +84,8 @@ services:
     environment:
       WAREHOUSE_DB_PATH: /app/warehouse/warehouse.duckdb
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
       CORS_ORIGINS: http://localhost:3000
     ports:
       - "8000:8000"

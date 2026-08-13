@@ -33,7 +33,7 @@ class AskRequest(BaseModel):
 
 class AskResult(BaseModel):
     question: str
-    mode: Literal["fast_path", "llm", "llm_not_implemented", "unavailable"]
+    mode: Literal["fast_path", "llm", "llm_error", "unavailable", "blocked"]
     answer: str
     data: Optional[list[dict[str, Any]]] = None
     sql: Optional[str] = None

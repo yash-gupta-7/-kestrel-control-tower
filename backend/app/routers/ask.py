@@ -7,28 +7,44 @@ Two tiers, by design (see DECISIONS.md):
      parametrized, tested query against the approved analytical views.
      Deterministic, correct, works with zero external dependencies.
   2. LLM fallback -- for anything that doesn't match a fast path. Requires
-     ANTHROPIC_API_KEY. THE CALL ITSELF IS NOT IMPLEMENTED YET in this
-     phase (see mode="llm_not_implemented" below) -- what's built here is
-     the contract it will plug into: sql_guard.validate_readonly_sql()
-     already enforces read-only + view-allowlist on any SQL that path
-     would produce, and this router already returns the right shape
-     (answer, data, sql, source, mode) so the frontend and this endpoint's
-     callers don't change when the LLM call is added.
+     GROQ_API_KEY. The model is asked for a single read-only SQL query (plus
+     a one-sentence answer lead-in) against the same approved analytical
+     views the fast paths use; the generated SQL is never trusted directly
+     -- it goes through sql_guard.validate_readonly_sql() (the same guard
+     that would gate any other LLM provider) before db.run_query() ever
+     touches it, so a mutation statement, a disallowed table, or a
+     malformed response fails closed into mode="llm_error", not a 500 and
+     not a silent wrong answer.
 
 If no API key is configured, free-form questions get an explicit
 mode="unavailable" response -- never a 500, never a silent wrong answer.
+
+Personal data (see privacy.py) is checked at four points before any
+free-form question or its result can leave this module: the question text
+(blocked-request phrases and PII-value patterns, both before Groq is ever
+called), the LLM-facing schema description (built with blocked columns
+excluded, asserted below), the generated SQL (after sql_guard, before
+execution), and the result rows (before they're returned). Any hit
+degrades to mode="blocked" -- never a 500, never partial data.
 """
+import json
+import logging
+import re
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
-from .. import config, date_utils
-from ..db import data_max_order_date, get_connection, run_query
+from .. import config, date_utils, privacy
+from ..db import ALLOWED_TABLES, data_max_order_date, get_connection, run_query
 from ..query_helpers import region_filter
 from ..schemas import AskRequest, AskResult, MetricResponse, SupportedQuestion
+from ..sql_guard import SQLGuardError, validate_readonly_sql
 from . import cold_chain, money, price_position, service
 
 router = APIRouter(prefix="/ask", tags=["ask"])
+logger = logging.getLogger(__name__)
+
+_BLOCKED_ANSWER = "Sorry, personal data cannot be queried through Ask Anything."
 
 
 def _flatten(mr: MetricResponse) -> list[dict]:
@@ -315,6 +331,134 @@ def supported_questions():
     ]
 
 
+# ---------------------------------------------------------------------------
+# LLM fallback (Groq). Only reached when no fast path matched.
+# ---------------------------------------------------------------------------
+
+# A compact, hand-written schema summary -- not pulled from the DB at
+# request time, since ALLOWED_TABLES + this description change only when a
+# person edits the warehouse build, not per-request. Kept short deliberately:
+# enough for the model to write a correct join, not a full data dictionary.
+# Every column named here is checked against the live warehouse.duckdb
+# schema (not invented), and every PII_BLOCKED_COLUMNS entry is
+# deliberately excluded -- see privacy.py for which columns those are and
+# why (this is layer 1 of the privacy design: the LLM is never even told
+# a blocked column exists).
+_SCHEMA_DESCRIPTION = """
+dim_region(region_id, region_code, region_name, status)
+dim_warehouse(warehouse_id, warehouse_code, warehouse_name, city, region_id, status)
+dim_route(route_id, route_code, route_name, region_id, status)
+dim_salesperson(salesperson_id, employee_code, region_id, designation, status)
+dim_outlet(outlet_id, outlet_code, outlet_name, city_canonical, region_id, is_test_outlet, is_deleted, status)
+dim_product(product_id, sku_code, product_name, brand, category, is_chilled, is_discontinued, discontinued_date, mrp_inr)
+dim_date(date, fiscal_year, fiscal_quarter)
+fact_order_lines(order_line_id, order_id, order_date, order_status, outlet_id, region_id, warehouse_id, route_id,
+    sku_code, product_name, category, ordered_eaches, delivered_eaches, ordered_cases, delivered_cases,
+    line_value_inr, is_chilled, ordered_after_discontinued)
+fact_deliveries(delivery_id, order_id, dispatch_datetime, outlet_id, region_id, warehouse_id, route_id,
+    delay_minutes, temperature_excursion_flag)
+fact_returns(return_id, return_date, outlet_id, region_id, category, return_reason_code, credit_note_value_inr)
+fact_freight(invoice_id, invoice_date, warehouse_id, route_id, carrier_id, carrier_name, amount_inr)
+fact_price_position(listing_id, sku_code, city, retailer, price_inr, mrp_gap_pct, match_confidence)
+fact_inventory_snapshot(snapshot_id, snapshot_date, warehouse_id, category, on_hand_cases, days_to_expiry)
+fact_weather(city, date)
+""".strip()
+
+# The schema shown to the LLM must never advertise a table the SQL guard
+# wouldn't actually allow it to query -- catches the two docs/allowlist
+# drifting apart, at import time rather than at question-answering time.
+# Table names start a line with no leading whitespace (`^\w+\(`); wrapped
+# continuation lines for wide tables are indented, so they don't match.
+assert set(re.findall(r"^(\w+)\(", _SCHEMA_DESCRIPTION, re.MULTILINE)) <= ALLOWED_TABLES
+
+# Privacy layer 1: the schema description must never mention a blocked
+# personal-data column, by name, anywhere -- checked at import time so a
+# future edit that accidentally re-adds e.g. `regional_manager` or
+# `contact_email` fails the container's own startup rather than shipping.
+assert not (privacy.ALL_BLOCKED_COLUMNS & set(re.findall(r"[\w]+", _SCHEMA_DESCRIPTION)))
+
+
+class GroqCallError(Exception):
+    """The Groq API call itself failed, or its response wasn't the
+    {"sql": ..., "answer_intro": ...} shape asked for -- distinct from the
+    SQL it returned failing the guard, which is a SQLGuardError instead."""
+
+
+_groq_client = None
+
+
+def _get_groq_client():
+    # Imported lazily so a missing/unconfigured `groq` package only breaks
+    # the LLM path, never the fast paths or app startup.
+    global _groq_client
+    if _groq_client is None:
+        from groq import Groq
+
+        _groq_client = Groq(api_key=config.GROQ_API_KEY)
+    return _groq_client
+
+
+def _generate_sql_with_groq(question: str, region_code: Optional[str]) -> tuple[str, str]:
+    """Asks Groq for a single read-only SQL query answering `question`,
+    returned as {"sql": ..., "answer_intro": ...} JSON. Raises
+    GroqCallError on any failure -- network, API, or malformed response.
+    Does NOT validate the SQL; that's sql_guard's job, called by `ask()`."""
+    region_hint = (
+        f" Scope the query to region_code = '{region_code}' via the relevant table's region_id "
+        "(join dim_region if needed)." if region_code else ""
+    )
+    system_prompt = (
+        "You are a read-only SQL assistant for Kestrel's supply-chain analytics warehouse (DuckDB). "
+        "Write exactly ONE SELECT or WITH...SELECT query that answers the user's question, using ONLY "
+        f"these tables and columns:\n{_SCHEMA_DESCRIPTION}\n\n"
+        "Rules: read-only SELECT/WITH only -- no INSERT/UPDATE/DELETE/DROP/ALTER/CREATE or any other "
+        "mutation; a single statement, no trailing semicolon, no SQL comments; reference only the "
+        "tables listed above (bare or qualified), never any other table." + region_hint + "\n"
+        'Respond with ONLY a JSON object of the exact shape {"sql": "<the query>", '
+        '"answer_intro": "<one short plain-English sentence introducing the answer, written as if you '
+        'have not seen the results yet -- no specific numbers>"}. No markdown, no commentary, JSON only.'
+    )
+    try:
+        client = _get_groq_client()
+        completion = client.chat.completions.create(
+            model=config.GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=600,
+        )
+        content = completion.choices[0].message.content
+    except Exception as e:  # noqa: BLE001 -- any Groq/network failure degrades to llm_error, never a 500
+        raise GroqCallError(f"Groq request failed: {e}") from e
+
+    try:
+        parsed = json.loads(content)
+        sql = parsed["sql"]
+        answer_intro = parsed.get("answer_intro") or "Here's what the data shows"
+        if not isinstance(sql, str) or not sql.strip():
+            raise ValueError("empty or non-string 'sql' field")
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        raise GroqCallError(f"Could not parse the model's response as the expected JSON shape: {e}") from e
+
+    return sql, answer_intro
+
+
+def _blocked(req: AskRequest, reason: str, sql: Optional[str] = None) -> AskResult:
+    # Log only a safe machine token -- never the question text, never a
+    # detected PII value, never the generated SQL's literal values.
+    logger.warning("ask_privacy_blocked reason=%s", reason)
+    return AskResult(
+        question=req.question, mode="blocked",
+        answer=_BLOCKED_ANSWER,
+        sql=sql,
+        caveats=["This build never sends personal-data fields to the AI model or returns them from "
+                 "free-form questions -- see README/DECISIONS.md for the privacy design."],
+    )
+
+
 @router.post("", response_model=AskResult)
 def ask(req: AskRequest):
     match = match_fastpath(req.question)
@@ -322,27 +466,99 @@ def ask(req: AskRequest):
         _qid, handler = match
         return handler(req.question, req.region_code)
 
-    if not config.ANTHROPIC_API_KEY:
+    # Privacy layer, step 1: block a request FOR a category of personal
+    # data outright (e.g. "show customer phone numbers") before Groq is
+    # ever called -- runs regardless of whether a key is configured.
+    try:
+        privacy.check_question_for_blocked_request(req.question)
+    except privacy.PrivacyBlockedError as e:
+        return _blocked(req, e.reason)
+
+    # Privacy layer, step 2: block a question containing a PII-shaped
+    # VALUE (an email, phone number, Aadhaar/PAN-style ID). A question
+    # naming a specific personal identifier almost always means "look
+    # this contact up by X," which requires a blocked column to answer at
+    # all -- rejected rather than forwarded, redacted or not (see
+    # privacy.redact_pii's docstring for the reasoning and the mechanism
+    # a looser policy could build on).
+    pii_category = privacy.detect_pii_value_category(req.question)
+    if pii_category:
+        return _blocked(req, f"blocked_pii_value_{pii_category}")
+
+    if not config.GROQ_API_KEY:
+        # Business-facing message deliberately says nothing about which env
+        # var gates this -- that's an implementation detail, not something
+        # an ops user needs to see. See /health's llm_configured field or
+        # README "Ask Anything" section for the actual configuration story.
         return AskResult(
             question=req.question, mode="unavailable",
             answer=(
                 "This doesn't match one of the questions this build can answer deterministically, "
-                "and no ANTHROPIC_API_KEY is configured for free-form questions. "
-                "See /ask/supported-questions for what's currently supported, "
-                "or set ANTHROPIC_API_KEY to enable AI-powered free-form questions."
+                "and AI-powered free-form questions aren't available right now. "
+                "See /ask/supported-questions for what this build can answer today."
             ),
-            caveats=["Free-form NL-to-SQL is designed (see sql_guard.py) but not implemented in this build."],
+            caveats=["AI is not configured for this deployment -- only the 8 supported questions are answered."],
         )
 
-    # A key is present -- the *contract* for this path is live (see module
-    # docstring), but the actual LLM call is out of scope for this phase.
+    try:
+        llm_sql, answer_intro = _generate_sql_with_groq(req.question, req.region_code)
+    except GroqCallError as e:
+        return AskResult(
+            question=req.question, mode="llm_error",
+            answer="Couldn't get an answer from the AI model for this question -- see caveats for why.",
+            caveats=[str(e)],
+        )
+
+    try:
+        validated_sql = validate_readonly_sql(llm_sql)
+    except SQLGuardError as e:
+        return AskResult(
+            question=req.question, mode="llm_error",
+            answer=(
+                "The model's generated query didn't pass this build's read-only SQL guard, so it was "
+                "never run against the database."
+            ),
+            sql=llm_sql,
+            caveats=[str(e)],
+        )
+
+    # Privacy layer, step 3: sql_guard only allowlists TABLES, not
+    # columns, so `SELECT contact_email FROM dim_outlet` passes the guard
+    # (dim_outlet is approved) -- this is the check that catches it,
+    # before the query is ever executed.
+    try:
+        privacy.check_sql_for_blocked_columns(validated_sql)
+    except privacy.PrivacyBlockedError as e:
+        return _blocked(req, e.reason, sql=validated_sql)
+
+    try:
+        with get_connection() as con:
+            rows = run_query(con, validated_sql)
+    except HTTPException as e:
+        return AskResult(
+            question=req.question, mode="llm_error",
+            answer="The model's query passed the SQL guard but failed to execute.",
+            sql=validated_sql,
+            caveats=[str(e.detail)],
+        )
+
+    # Privacy layer, step 4: final defense in depth on the actual result
+    # rows, independent of what the SQL text looked like.
+    try:
+        privacy.check_result_for_blocked_columns(rows)
+    except privacy.PrivacyBlockedError as e:
+        return _blocked(req, e.reason, sql=validated_sql)
+
+    answer = f"{answer_intro} ({len(rows)} row{'s' if len(rows) != 1 else ''} returned)."
     return AskResult(
-        question=req.question, mode="llm_not_implemented",
-        answer=(
-            "ANTHROPIC_API_KEY is configured, so free-form questions are allowed in principle, but the "
-            "LLM NL-to-SQL call itself isn't implemented yet in this build. "
-            "See /ask/supported-questions for what's currently supported."
-        ),
-        caveats=["Next step: implement the LLM call, validate its SQL with sql_guard.validate_readonly_sql(), "
-                 "execute via db.run_query(), and return mode='llm'."],
+        question=req.question, mode="llm",
+        answer=answer, data=rows, sql=validated_sql,
+        source="LLM-generated SQL (Groq), validated read-only against the approved analytical views",
+        caveats=[
+            "This answer was generated by an AI model from your question, not by a human-written, "
+            "tested query like the 8 supported questions -- the SQL is shown above so you can verify "
+            "it before relying on the result.",
+        ] + (["Region scoping for free-form questions is a prompt instruction to the model, not a "
+              "structural guarantee the way it is on the dashboard endpoints -- check the SQL above if "
+              "the region scope matters for this answer."] if req.region_code else []),
     )
