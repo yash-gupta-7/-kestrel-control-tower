@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Card } from "../components/Card";
 import { DataState } from "../components/States";
 import { MetricTable } from "../components/MetricTable";
-import { Callout, CaveatList } from "../components/Callout";
+import { Callout, MethodologyDetails } from "../components/Callout";
 import { PeriodPicker } from "../components/PeriodPicker";
 import { useApi } from "../lib/useApi";
 import { apiPost, buildQuery } from "../lib/api";
@@ -40,8 +40,8 @@ export default function Service() {
 
       <div className="grid grid-2" style={{ marginBottom: 16 }}>
         <Card
-          title="Fill rate (eaches)"
-          subtitle="Worst performers first. Reported in eaches only — see note below."
+          title="Fill rate — eaches"
+          subtitle="Worst performers first."
           right={
             <select className="select" value={fillGroupBy} onChange={(e) => setFillGroupBy(e.target.value)}>
               <option value="outlet">By outlet</option>
@@ -77,7 +77,7 @@ export default function Service() {
             )}
           </DataState>
           <div style={{ marginTop: 10 }}>
-            <CaveatList caveats={fillRate.data?.caveats} />
+            <MethodologyDetails caveats={fillRate.data?.caveats} />
           </div>
         </Card>
 
@@ -93,13 +93,10 @@ export default function Service() {
             </select>
           }
         >
-          <Callout variant="warn" title="Why OTIF reads near-zero here">
-            Strict OTIF requires every case ordered to arrive on time <em>and</em> in full, with no
-            tolerance. In this dataset, essentially no order is ever delivered at 100% of what was
-            ordered — every order line carries some shortfall. That makes strict OTIF read as ~0%
-            everywhere. This is a genuine finding about the data, not a broken dashboard — use{" "}
-            <strong>Avg. fulfilment %</strong> below as the working signal until Kestrel defines a real
-            shrinkage-tolerance policy.
+          <Callout variant="warn" title="Why OTIF reads near zero">
+            Strict OTIF requires every ordered unit to be fully delivered and on time. The current data
+            shows almost no orders meeting that definition. <strong>Avg. fulfilment</strong> is shown
+            alongside OTIF as the more actionable service signal.
           </Callout>
           <div style={{ height: 12 }} />
           <DataState
@@ -128,7 +125,7 @@ export default function Service() {
             )}
           </DataState>
           <div style={{ marginTop: 10 }}>
-            <CaveatList caveats={otif.data?.caveats} />
+            <MethodologyDetails caveats={otif.data?.caveats} />
           </div>
         </Card>
       </div>

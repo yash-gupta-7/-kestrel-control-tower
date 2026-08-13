@@ -73,8 +73,9 @@ export default function Overview() {
       <Card className="mb-0" style={{ marginBottom: 18 }}>
         <KpiRow>
           <Kpi
-            label="Fill rate (eaches), last month"
+            label="Fill rate, last month"
             value={overallFillRate !== null ? formatPct(overallFillRate) : "…"}
+            sub="Measured in eaches"
           />
           <Kpi
             label="Avg. fulfilment %, last quarter"

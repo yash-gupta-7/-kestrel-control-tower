@@ -149,9 +149,8 @@ export default function AskAnything() {
       {history.length === 0 && !asking && (
         <Card>
           <div className="state-block">
-            Ask one of the questions above, or type your own. Anything outside the supported list needs
-            an ANTHROPIC_API_KEY on the backend — without one, you'll get a clear "AI unavailable"
-            answer, not a failure.
+            Ask a question about your supply chain. Choose a suggested question or ask your own in plain
+            English.
           </div>
         </Card>
       )}

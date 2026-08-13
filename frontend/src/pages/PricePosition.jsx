@@ -27,11 +27,17 @@ export default function PricePosition() {
 
   return (
     <div>
-      <Callout variant="neutral" title="Conservative matching">
-        Competitor listings are matched to Kestrel SKUs by brand, category and pack size. Only listings
-        where exactly one SKU fits are treated as a confident match — the rest are shown as{" "}
-        <strong>no confident match</strong> rather than guessed. Across all 4 cities, 614 of 1,137 scraped
-        listings (54%) match with confidence.
+      <Callout variant="neutral" title="Conservative competitor matching">
+        Only unambiguous SKU matches are used. Uncertain matches are excluded rather than guessed.
+        <div className="callout-stat">614 / 1,137 listings · 54% matched with confidence</div>
+        <details className="methodology-details">
+          <summary>How matching works</summary>
+          <div className="caveat-list-plain">
+            Competitor listings are matched to Kestrel SKUs by brand, category and pack size. Only
+            listings where exactly one SKU fits are treated as a confident match — the rest are shown as{" "}
+            <strong>no confident match</strong> rather than guessed, across all 4 cities.
+          </div>
+        </details>
       </Callout>
 
       {activeRegionName && (

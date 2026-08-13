@@ -32,3 +32,17 @@ export function CaveatList({ caveats }) {
     </ul>
   );
 }
+
+// Tucks the full engineering/data-quality reasoning (backend caveats) behind
+// a native, no-JS disclosure widget instead of dumping it straight onto the
+// business-facing page -- the reasoning itself is unchanged, only where it's
+// visible from by default.
+export function MethodologyDetails({ caveats, label = "Data methodology" }) {
+  if (!caveats || caveats.length === 0) return null;
+  return (
+    <details className="methodology-details">
+      <summary>{label}</summary>
+      <CaveatList caveats={caveats} />
+    </details>
+  );
+}

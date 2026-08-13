@@ -61,6 +61,18 @@ export function fiscalLabel(fy, fq) {
   return `FY${fy} Q${fq}`;
 }
 
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// Business-facing "Apr–Jun 2026" instead of raw ISO "2026-04-01 to
+// 2026-06-30" -- same underlying bounds, just for display copy.
+export function monthRangeLabel(start, end) {
+  const [ys, ms] = start.split("-").map(Number);
+  const [ye, me] = end.split("-").map(Number);
+  const startLabel = MONTH_ABBR[ms - 1];
+  const endLabel = MONTH_ABBR[me - 1];
+  return ys === ye ? `${startLabel}–${endLabel} ${ye}` : `${startLabel} ${ys}–${endLabel} ${ye}`;
+}
+
 // All fiscal quarters fully or partially covered by the dataset, most
 // recent first -- for the quarter picker.
 export function listFiscalQuarters() {
