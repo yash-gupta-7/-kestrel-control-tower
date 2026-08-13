@@ -49,9 +49,11 @@ silently falling back to a bogus path — see "How the assignment pack is
 used" below.
 
 To run it with the AI-powered free-form question path enabled, set
-`ANTHROPIC_API_KEY` in `.env` before starting. Everything else — including
-all 8 of the illustrative questions from the assignment brief — works
-identically with or without a key.
+`GROQ_API_KEY` in `.env` before starting (get a key at
+[console.groq.com/keys](https://console.groq.com/keys) — never commit a real
+key; `.env` is git-ignored for exactly this reason). Everything else —
+including all 8 of the illustrative questions from the assignment brief —
+works identically with or without a key.
 
 ## How the assignment pack is used
 
@@ -92,7 +94,17 @@ under Docker Desktop → Settings → Resources → File Sharing.
   outlet/region/warehouse/route.
 - **Money** — freight cost per delivered case, returns as leakage.
 - **Ask Anything** — type a question, or click one of the 8 suggested
-  ones from the assignment brief.
+  ones from the assignment brief. Those 8 are answered deterministically by
+  hand-written, tested queries, with zero external dependencies. Anything
+  else is answered by asking an LLM (Groq) to write a SQL query — the
+  generated SQL is displayed alongside the answer for auditability, and is
+  validated read-only against the same approved analytical views before it
+  ever runs (see "SQL guard" in DECISIONS.md). Without `GROQ_API_KEY` set,
+  free-form questions get a clear "AI unavailable" response instead of
+  failing. Ask Anything applies rule-based privacy filtering before
+  sending a question to the LLM. Personal-data fields are excluded from
+  the LLM schema and blocked queries are rejected before execution (see
+  "Personal data protection" in DECISIONS.md).
 - **Cold Chain** — temperature excursions, near-expiry stock, cold-chain
   returns. Deliberately lighter than Service/Money/Ask (see priority
   allocation in DECISIONS.md).
@@ -141,7 +153,9 @@ serves the production build on :3000 instead).
 | Variable | Where | Default | Purpose |
 |---|---|---|---|
 | `ASSIGNMENT_PACK_DIR` | `.env`, Docker only | — (required, build fails without it) | Path to the unzipped assignment pack. Used as a runtime mount source for `data/`, and as a build-time source for `bazaarpulse_site/`/`partner_api/` |
-| `ANTHROPIC_API_KEY` | `.env` / shell env | empty | Enables the free-form Ask Anything path. Optional. |
+| `GROQ_API_KEY` | `.env` / shell env | empty | Enables the free-form Ask Anything path (LLM-generated, SQL-guard-validated queries). Optional. |
+| `GROQ_MODEL` | `.env` / shell env | `llama-3.3-70b-versatile` | Which Groq model answers free-form questions. |
+| `ANTHROPIC_API_KEY` | `.env` / shell env | empty | Legacy/unused — kept for compatibility with earlier docs; no code path calls it. |
 | `KESTREL_DB_PATH` | ETL env | `/data/kestrel_ops.db` | Path to the SQLite operational DB |
 | `WAREHOUSE_DB_PATH` | ETL + backend env | `warehouse/warehouse.duckdb` | The cleaned DuckDB store both read/write |
 | `VITE_API_BASE_URL` | frontend build arg | `http://localhost:8000` | Where the browser sends API calls |

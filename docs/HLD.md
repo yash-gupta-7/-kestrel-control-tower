@@ -15,7 +15,7 @@ It is **not a microservices architecture**. It's a small containerized applicati
 
 New since the last review: a **region selector** in the top bar lets a regional manager scope Service, Money, Cold Chain, and Ask Anything to one of Kestrel's 5 sales regions (`GET /meta/regions` backs the dropdown). It's a plain `WHERE region_id = ...` filter threaded through the existing endpoints — not authentication, not a new permission system — and it degrades to "All Regions" if `/meta/regions` fails. **Price Position is the deliberate exception**: competitor listings are scraped by city, not by Kestrel sales region, and the two aren't mapped in the data, so that page shows an explicit callout instead of silently ignoring the selector. OTIF also gained `group_by=outlet` (fill rate always had it; this was a parity gap, not a new capability). And the SQL guard that will gate the future LLM path got materially hardened: it now resolves quoted identifiers, comment-obfuscated `FROM`/`JOIN` separators, schema-qualified references, and comma-separated FROM lists (implicit joins, closed in the final release audit) that used to slip past a bareword-only regex — backed by 33 dedicated unit tests.
 
-The one deliberately unfinished piece, unchanged: **Ask Anything** has two tiers. Eight illustrative questions are answered deterministically, in Python, against the same warehouse the dashboard uses — no LLM involved. Anything else requires `ANTHROPIC_API_KEY`; if it's absent, the API says so and keeps working. If it's present, the *contract* for the LLM path (read-only SQL guard, table allowlist, response shape) is fully built — but the actual Anthropic API call is **not implemented**. That boundary is stated in the code, in `DECISIONS.md`, and in this document.
+**Ask Anything** has two tiers, both real. Eight illustrative questions are answered deterministically, in Python, against the same warehouse the dashboard uses — no LLM involved, and they always win even when an LLM key is configured. Anything else is answered by Groq (`GROQ_API_KEY`, default model `llama-3.3-70b-versatile`): the model writes a SQL query against a compact schema description, and that query is validated read-only against the approved analytical views by `sql_guard.py` — the same guard hardened across two audit passes — before it's ever executed. If no key is configured, the API says so (without naming the env var in the response) and keeps working on the 8 fast paths.
 
 Also new: a real `pytest` suite (`backend/tests/`) — SQL-guard unit tests, query-parameter validation regression tests, and integration tests against the live warehouse covering all 8 illustrative questions, OTIF-by-outlet, and every region-filter code path. It isn't wired into any CI pipeline (there isn't one), and it isn't installed in the production Docker image — but it's real, runnable, and it's what caught most of the bugs this correction pass fixed.
 
@@ -303,7 +303,7 @@ erDiagram
 
 ## 5. Ask Anything Architecture
 
-Two tiers, unchanged in structure from the prior design, now region-aware on the fast-path side.
+Two tiers. The 8 fast paths are unchanged in structure from the prior design and region-aware; the LLM fallback, previously a contract-only stub, is now a real, working path (Groq).
 
 ```mermaid
 sequenceDiagram
@@ -312,6 +312,8 @@ sequenceDiagram
     participant API as FastAPI POST /ask
     participant FP as match_fastpath()<br/>(keyword sets, 8 questions)
     participant RT as Existing router fn<br/>(e.g. service.fill_rate)
+    participant Priv as privacy.py<br/>(rule-based PII policy)
+    participant LLM as Groq (llama-3.3-70b-versatile)
     participant Guard as sql_guard.py<br/>validate_readonly_sql()
     participant DB as DuckDB warehouse<br/>(read_only=True)
 
@@ -327,29 +329,68 @@ sequenceDiagram
         RT-->>API: MetricResponse / rows
         API-->>FE: AskResult(mode="fast_path", answer, data, sql?, source, caveats)
     else Unknown question
-        alt ANTHROPIC_API_KEY not configured
-            API-->>FE: AskResult(mode="unavailable",<br/>answer="…set ANTHROPIC_API_KEY to enable free-form questions")
-        else ANTHROPIC_API_KEY configured
-            Note over API: LLM call itself is NOT implemented in this build.<br/>What exists: the contract it will plug into.
-            API-->>FE: AskResult(mode="llm_not_implemented")
+        API->>Priv: check_question_for_blocked_request(question)
+        alt Question asks FOR a personal-data category<br/>("show customer phone numbers")
+            Priv-->>API: PrivacyBlockedError
+            API-->>FE: AskResult(mode="blocked") — Groq never called
+        else Not a blocked-category request
+            API->>Priv: detect_pii_value_category(question)
+            alt Question contains a PII-shaped VALUE<br/>(email / phone / Aadhaar-style / PAN-style)
+                Priv-->>API: category found
+                API-->>FE: AskResult(mode="blocked") — Groq never called,<br/>original value never sent
+            else No PII detected
+                alt GROQ_API_KEY not configured
+                    API-->>FE: AskResult(mode="unavailable",<br/>business-facing message, no env var named)
+                else GROQ_API_KEY configured
+                    API->>LLM: privacy-filtered schema description<br/>(blocked columns excluded) + the question
+                    LLM-->>API: {"sql": "...", "answer_intro": "..."} JSON<br/>(or a call/parse failure)
+                    alt Groq call or response parsing failed
+                        API-->>FE: AskResult(mode="llm_error")
+                    else Got SQL
+                        API->>Guard: validate_readonly_sql(sql)
+                        alt Guard rejects (mutation, disallowed table,<br/>comma-join, multi-statement, etc.)
+                            Guard-->>API: SQLGuardError
+                            API-->>FE: AskResult(mode="llm_error", sql shown, never executed)
+                        else Guard passes (table-level only)
+                            API->>Priv: check_sql_for_blocked_columns(sql)
+                            alt SQL references a blocked column<br/>(e.g. SELECT contact_email FROM dim_outlet —<br/>passes Guard, dim_outlet IS approved)
+                                Priv-->>API: PrivacyBlockedError
+                                API-->>FE: AskResult(mode="blocked", sql shown, never executed)
+                            else No blocked column referenced
+                                API->>DB: run_query(validated_sql)
+                                alt Execution fails (malformed SQL, DuckDB error)
+                                    DB-->>API: error
+                                    API-->>FE: AskResult(mode="llm_error", sql shown)
+                                else Rows returned
+                                    DB-->>API: rows
+                                    API->>Priv: check_result_for_blocked_columns(rows)
+                                    alt A result column name is blocked (defense in depth)
+                                        Priv-->>API: PrivacyBlockedError
+                                        API-->>FE: AskResult(mode="blocked", sql shown, no data)
+                                    else Result is clean
+                                        API-->>FE: AskResult(mode="llm", answer, data, sql, source="Groq", caveats)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
         end
     end
-    FE-->>User: renders answer text, SQL (if any), data table, caveats
-
-    Note over API,DB: Designed (not yet wired) path for when the LLM call is added:<br/>LLM generates SQL → sql_guard.validate_readonly_sql() → resolves quoted/<br/>comment-obfuscated identifiers, checks tables ⊆ ALLOWED_TABLES, rejects<br/>mutation keywords → db.run_query() → AskResult(mode="llm")
+    FE-->>User: renders answer text, SQL (if any), data table, caveats,<br/>"Answered" / "Answered (AI)" / "Not available" badge
 ```
 
 **What's real today:**
 
-- The **8 illustrative questions** are matched by simple keyword-set matching (`_FASTPATH_HANDLERS` in `backend/app/routers/ask.py`) — not NLP, not an LLM. Every handler now accepts `region_code` and threads it into its underlying query via `query_helpers.region_filter()`; when `region_code` is set, the answer text says so (`_region_note()`) so the scoping is never silent.
+- The **8 illustrative questions** are matched by simple keyword-set matching (`_FASTPATH_HANDLERS` in `backend/app/routers/ask.py`) — not NLP, not an LLM — and **always take priority** over the LLM path, even when a Groq key is configured. Every handler accepts `region_code` and threads it into its underlying query via `query_helpers.region_filter()`; when `region_code` is set, the answer text says so (`_region_note()`) so the scoping is never silent.
 - **One handler is explicitly exempt**: `_q6_price_gap_top_skus` (competitor pricing, fixed to Mumbai) appends a caveat rather than applying `region_code` — same city-vs-region gap as the dedicated Price Position page (Section 4, 8).
-- **`sql_guard.validate_readonly_sql()`** — hardened in this pass, detailed in Section 7 and 11 — rejects anything that isn't a single `SELECT`/`WITH` statement, rejects mutation keywords, and checks every `FROM`/`JOIN` table reference (bare, quoted, or schema-qualified, with comment-obfuscated separators) against `db.ALLOWED_TABLES`.
+- **The Groq fallback is now implemented, not just contracted.** `_generate_sql_with_groq()` sends the model a compact, hand-written schema description — table and column names only, no live data, and nothing from the raw operational tables (which don't exist in the warehouse file at all — Section 3) — plus the user's question, and asks for `{"sql": ..., "answer_intro": ...}` JSON. Two `assert`s at import time check the schema description against the live system: every table named is a subset of `db.ALLOWED_TABLES`, and no column named is one of `privacy.ALL_BLOCKED_COLUMNS` — so the description shown to the model can never drift ahead of either the SQL guard's table allowlist or the privacy policy's column blocklist.
+- **Rule-based personal-data protection (`backend/app/privacy.py`) — new, deterministic, no LLM involved in the detection itself.** Four layers: (1) schema filtering, above; (2) question-level blocking, both a fixed-phrase check for requests *for* a personal-data category and a regex check for a PII-shaped *value* embedded in the question, both running before Groq is ever called; (3) SQL-level blocking after the guard passes, since the guard only checks table names and `SELECT contact_email FROM dim_outlet` would otherwise pass it (`dim_outlet` is an approved table); (4) result-level blocking as a final check on actual column names returned. See Section 11 for the full column list and DECISIONS.md "Personal data protection" for the design rationale.
+- **`sql_guard.validate_readonly_sql()`** — the same guard hardened across two audit passes (Section 7 and 11) — is applied to *every* piece of LLM-generated SQL before it can reach the database, with no exceptions; the privacy layer runs in addition to it, not instead of it. Region scoping for free-form questions is a prompt instruction to the model, not a structural guarantee like the fast paths; the UI states this caveat when a region is selected.
+- Five distinct failure/block points — the Groq call/response itself, the guard, SQL-level privacy, execution, and result-level privacy — each degrade to a clean, generic message and no data, never a 500 and never a leaked value.
 - **`GET /ask/supported-questions`** lets the frontend render the 8 example questions as clickable chips.
-
-**What's explicitly not implemented, stated everywhere — code, `DECISIONS.md`, this document:**
-
-- The actual **Anthropic API call**. `ask.py`'s `POST /ask` handler, when no fast-path matches, returns `mode="unavailable"` (no key) or `mode="llm_not_implemented"` (key present, call not built) — **never a 500, never a guessed answer.**
-- If/when added, it plugs into the already-hardened guard: generate SQL → `validate_readonly_sql()` → `db.run_query()` → return `mode="llm"`. The `AskResult` contract already supports this mode.
+- **`GET /health`'s `llm_configured` field** now reflects `GROQ_API_KEY`, not `ANTHROPIC_API_KEY` — it tracks whether the free-form path is actually usable.
 
 ---
 
@@ -425,9 +466,13 @@ flowchart TB
 
     F8["Invalid region_code<br/>(unknown code, e.g. typo)"] --> F8R["region_filter()'s scalar subquery<br/>resolves to NULL; region_id = NULL is<br/>false for every row → empty result set,<br/>not an error. Same pattern as an<br/>unmatched warehouse_code filter."]
 
-    F9["ANTHROPIC_API_KEY<br/>absent"] --> F9R["ask.py: unmatched question returns<br/>mode='unavailable'. NEVER a 500."]
+    F9["GROQ_API_KEY<br/>absent"] --> F9R["ask.py: unmatched question returns<br/>mode='unavailable', no env var named<br/>in the response. NEVER a 500."]
 
-    F10["LLM-generated SQL invalid<br/>(mutation keyword, multi-statement)"] --> F10R["sql_guard.validate_readonly_sql()<br/>raises SQLGuardError before execution.<br/>Contract ready; unreachable today —<br/>the LLM call itself isn't wired up."]
+    F10a["Groq call fails, or its response<br/>isn't the expected JSON shape"] --> F10aR["GroqCallError caught in ask.py →<br/>mode='llm_error'. NEVER a 500."]
+
+    F10["LLM-generated SQL invalid<br/>(mutation keyword, multi-statement,<br/>disallowed table, comma-join)"] --> F10R["sql_guard.validate_readonly_sql()<br/>raises SQLGuardError before execution →<br/>mode='llm_error', SQL shown, never run."]
+
+    F10b["LLM-generated SQL passes the guard<br/>but is malformed / fails at DuckDB"] --> F10bR["run_query() raises, caught in ask.py →<br/>mode='llm_error'. NEVER a 500."]
 
     F11["SQL references a non-allowlisted<br/>table — bare, quoted, schema-qualified,<br/>comment-obfuscated, or comma-joined"] --> F11R["Hardened table-reference regex resolves<br/>all forms and un-quotes identifiers<br/>before the ALLOWED_TABLES check;<br/>a CTE alias never exempts a<br/>schema-qualified reference to the same name;<br/>comma-separated FROM lists rejected outright.<br/>33 unit tests in test_sql_guard.py."]
 ```
@@ -445,8 +490,10 @@ flowchart TB
 | Warehouse missing at query time | — | — | ✓ (503 with guidance) | — |
 | Backend query error | — | — | ✓ (500, request-scoped) | — |
 | Invalid/unknown region_code | — | — | ✓ (empty result, not an error) | — |
-| Anthropic key absent | — | — | ✓ (`unavailable` mode) | — |
-| LLM SQL invalid / disallowed table (any quoting form) | — | — | ✓ (guard rejects before execution) | — |
+| Groq key absent | — | — | ✓ (`unavailable` mode) | — |
+| Groq call fails / bad response shape | — | — | ✓ (`llm_error` mode) | — |
+| LLM SQL invalid / disallowed table (any quoting form) | — | — | ✓ (guard rejects before execution → `llm_error`) | — |
+| LLM SQL passes guard but fails at execution | — | — | ✓ (`llm_error` mode) | — |
 
 ---
 
@@ -502,7 +549,7 @@ Single FastAPI app (`backend/app/main.py`), **seven** routers, all read-only. CO
 | Endpoint | Key params | Purpose |
 |---|---|---|
 | `GET /ask/supported-questions` | — | Lists the 8 fast-path questions |
-| `POST /ask` | body: `{question: string (3–500 chars), region_code?: string}` | Answers via fast path (region-aware for 7 of 8; `q6` is exempt, see Section 5), or returns `unavailable`/`llm_not_implemented` |
+| `POST /ask` | body: `{question: string (3–500 chars), region_code?: string}` | Answers via fast path (region-aware for 7 of 8; `q6` is exempt, see Section 5); otherwise via Groq + `sql_guard`, or `unavailable`/`llm_error` |
 
 **Not documented here because they do not exist:** any write endpoints, any auth endpoints, any endpoint outside these seven routers, any endpoint touching the raw operational schema (dropped after the warehouse build).
 
@@ -580,11 +627,11 @@ Classified as **business definition** (reflects how Kestrel wants the number def
 
 Only what actually exists.
 
-- **Secrets via environment variables only.** `ASSIGNMENT_PACK_DIR`, `ANTHROPIC_API_KEY`, `KESTREL_DB_PATH`, `WAREHOUSE_DB_PATH`, `PARTNER_API_KEY`, `CORS_ORIGINS` all read from the environment; none hardcoded in application logic (one low-risk exception: `PARTNER_API_KEY`'s fallback default in `etl/config.py` is a fixture key for the assignment's own mock API).
+- **Secrets via environment variables only.** `ASSIGNMENT_PACK_DIR`, `GROQ_API_KEY`, `GROQ_MODEL`, `KESTREL_DB_PATH`, `WAREHOUSE_DB_PATH`, `PARTNER_API_KEY`, `CORS_ORIGINS` all read from the environment; none hardcoded in application logic (one low-risk exception: `PARTNER_API_KEY`'s fallback default in `etl/config.py` is a fixture key for the assignment's own mock API). `ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` remain readable for compatibility with earlier docs but are not called by any code path.
 - **`.env` is git-ignored**, along with `/data/`, `*.db`, `/cache/`, `/warehouse/*.duckdb*`.
 - **Read-only analytical querying, enforced at the connection level.** `get_connection()` always opens DuckDB with `read_only=True`; the backend container also mounts `warehouse_data` as `:ro`.
 - **No raw-table access from any code path.** `build_warehouse.py` runs `DROP SCHEMA raw CASCADE` — the raw operational tables physically do not exist in the file the backend opens.
-- **Hardened SQL allowlisting — the correction pass's biggest security change, hardened again in the final release audit.** `sql_guard.validate_readonly_sql()` gates any SQL not built by hand-written, parametrized backend code (i.e. the future LLM path). Across both passes, four bypasses have been found and closed:
+- **Hardened SQL allowlisting — the correction pass's biggest security change, hardened again in the final release audit.** `sql_guard.validate_readonly_sql()` gates any SQL not built by hand-written, parametrized backend code — that's exactly the LLM path (Section 5), and every piece of Groq-generated SQL goes through this guard with no exceptions before it can touch the database. Across both audit passes, four bypasses have been found and closed:
   - **Quoted-identifier bypass (the original bug).** The old table-reference regex only matched bareword identifiers after `FROM`/`JOIN`; `FROM "information_schema"."tables"` was invisible to it and passed straight through. The new regex (`_TABLE_REF_RE`) resolves bare, quoted (`"..."`, with `""`-escaped internal quotes), and schema-qualified references in any combination, then un-quotes them before the `ALLOWED_TABLES` check.
   - **Comment-obfuscated separators.** `FROM/**/information_schema.tables` is valid SQL — a real lexer treats a block comment as whitespace. The guard's separator pattern (`_SEP`) now matches "whitespace or a `/* ... */` block comment" as one unit, so this can't slip past a naive `\s+`-based check.
   - **CTE-alias collision.** A schema-qualified reference (`information_schema.tables`) is **never** exempted by a CTE alias of the same bare name (`WITH tables AS (...)`), because CTEs can't be schema-prefixed in DuckDB — closing a path where a disallowed table could be smuggled past the allowlist by naming a CTE the same thing.
@@ -595,7 +642,14 @@ Only what actually exists.
 - **`fiscal_quarter` and `fiscal_year` both bounds-checked.** `fiscal_quarter: Query(None, ge=1, le=4)` (fixed in an earlier pass) and `fiscal_year: Query(None, ge=2000, le=2100)` (fixed in this pass, after `fiscal_year=0`/negative/`99999` was found to hit an unhandled `ValueError` from Python's `date()` constructor) — both now return a clean 422 instead of a bare 500, across all six affected endpoints.
 - **`near_expiry_days` bounds-checked**, `Query(30, ge=1, le=365)` — previously unbounded.
 - **`region_code` is a scoping filter, not an authorization boundary.** An unrecognized code resolves to `NULL` via a scalar subquery against `dim_region`, which matches no rows — an empty result, not an error, not a way to bypass anything (there's nothing to bypass; there's no per-region access control, only a per-region *view*).
-- **API key optionality is a first-class behaviour.** `ANTHROPIC_API_KEY` empty is the default; `GET /health` reports `llm_configured: bool`; `POST /ask` never 500s regardless of key presence.
+- **API key optionality is a first-class behaviour.** `GROQ_API_KEY` empty is the default; `GET /health` reports `llm_configured: bool`; `POST /ask` never 500s regardless of key presence, and its user-facing "unavailable"/"llm_error" messages never name the env var.
+- **Rule-based personal-data protection (`backend/app/privacy.py`) — new, deterministic, no LLM used to detect PII.** sql_guard.py allowlists tables, not columns, so an approved table's personal-data columns aren't covered by it; this closes that gap for the LLM path specifically (the fast paths never touch these columns at all, by construction — they're hand-written queries against a fixed set of columns). The actual personal-data-bearing columns, found by inspecting the raw schema and the live `warehouse.duckdb` (not invented):
+  - `dim_outlet`: `contact_name`, `contact_phone`, `contact_email` (the outlet's contact person), `gst_number` (government tax ID)
+  - `dim_salesperson`: `full_name`
+  - `dim_warehouse`: `manager_name`
+  - `dim_region`: `regional_manager` (also legitimately shown in the region-selector UI via `GET /meta/regions` — a separate, fixed, brief-driven feature; blocking it from the LLM path doesn't affect that endpoint)
+
+  Everything else the app runs on — `outlet_code`, `route_code`, `warehouse_code`, `sku_code`, `region_code`, and the rest of the operational identifiers — is explicitly not personal data and stays available. Four layers, all before/around the SQL guard, not replacing it: schema filtering (blocked columns excluded from what Groq is even told exists, `assert`-checked at import time), question-level blocking (a fixed-phrase check for a request *for* a personal-data category, a regex check for an embedded PII-shaped *value* — email, phone, Aadhaar-style, PAN-style — both before Groq is ever called), SQL-level blocking (a word-boundary scan for a blocked column name in the guard-passed SQL, since the guard's table-level allowlist doesn't cover this), and result-level blocking (a final check on actual returned column names). Any hit returns `mode="blocked"` with a fixed generic message and logs only a safe reason token, never the question text or a detected value. **Defense in depth, not a claim of impossibility** — the regexes are heuristic (a bare 10-digit number can false-positive as a phone number; accepted, since over-blocking fails safe) and the SQL-level check is a text scan, not a real SQL parser. 53 unit/integration tests in `backend/tests/test_privacy.py` and `backend/tests/test_ask_llm.py`.
 - **What does *not* exist, explicitly:** no authentication, no authorization/RBAC, no OAuth, no API keys required to call the Control Tower's own API, no WAF, no rate limiting, no per-user or per-region data isolation (the region selector is a client-side convenience, not a server-enforced boundary — a client could request any region's data by passing any `region_code`, which is fine because there's no notion of "a user's own region" to protect in the first place). All five Docker images run as `root` (no `USER` directive) — a real hardening gap before any multi-tenant deployment, low blast radius today.
 
 ---
@@ -618,7 +672,7 @@ Only what actually exists.
 
 **With more external API data:** BazaarPulse/Partner API growth scales ETL wall-clock time linearly; both are already resilient to the mocks' injected failures (Section 6). Weather is bounded by city-count × day-count.
 
-**With more NL-to-SQL questions:** today, **only the 8 fast-path questions work at all** — everything else needs the LLM call that isn't implemented (Section 5). Adding fast-path handlers scales fine (more Python); genuinely open-ended questions are architecturally blocked until the LLM call exists, independent of any infra scaling.
+**With more NL-to-SQL questions:** the 8 fast paths are free (no LLM cost, no latency, no hallucination risk) and scale by adding more Python handlers. Genuinely open-ended questions now go to Groq — real and working, but each one is a network round trip plus a `sql_guard` pass, and correctness depends on the model's generated SQL rather than a tested, hand-written query — the SQL is always shown so a user can verify it, but it is not guaranteed correct the way the fast paths are. No response caching exists yet, so repeated identical free-form questions each cost a fresh Groq call.
 
 **Current, real limitations (from `DECISIONS.md`'s own updated assessment):**
 - Single-file DuckDB, no concurrent-write story.
@@ -626,7 +680,7 @@ Only what actually exists.
 - Batch ETL, not incremental.
 - Competitor matching deliberately conservative — ~46% of listings excluded from price views.
 - Known data-quality issues (OTIF near-zero, `delay_minutes` vs. timestamps disagreeing 87% of the time) are reported, not resolved.
-- The Ask Anything LLM boundary remains the single largest functional gap versus the brief's framing.
+- Free-form Ask Anything correctness depends on Groq's generated SQL, not a tested query — the SQL is shown for verification, but is not guaranteed correct the way the 8 fast paths are.
 - **All five Docker images run as root** — standard hardening gap, low blast radius single-tenant, real before multi-tenant use.
 - **No structured server-side logging beyond uvicorn's default stderr** — fine for a take-home, not for debugging a production incident; would want request logging with correlation IDs and query text on 500s.
 - **No CI pipeline** — the real pytest suite (Section 13) exists but nothing runs it automatically on push/PR today.
@@ -636,7 +690,7 @@ Only what actually exists.
 - Pre-aggregate or materialize the heaviest views instead of scanning `fact_order_lines` per request.
 - Incremental ETL instead of a full rebuild.
 - Authentication, authorization, and rate limiting before any real production/multi-tenant use.
-- Implement the actual Anthropic API call, with response caching for repeated questions.
+- Response caching for repeated free-form questions (currently every LLM question is a fresh Groq call); a second model call to phrase the final answer from actual result rows instead of the pre-results `answer_intro`.
 - Move off a single embedded DuckDB file to a client-server analytical store if concurrent-write or multi-region infrastructure requirements emerge (note: this is an infrastructure question, distinct from the region *view* filter already built).
 - Add a `USER` directive to all five Dockerfiles; add structured request logging with correlation IDs; wire the existing pytest suite into a CI pipeline.
 
@@ -672,8 +726,8 @@ What exists today:
 | **ETL** | Python 3.11, `duckdb` 1.5.5, `pandas` (≥2.0), stdlib `sqlite3`/`urllib`/`csv`/`zoneinfo`/`urllib.robotparser` |
 | **External sources** | Kestrel operational SQLite DB + CSVs (assignment pack); BazaarPulse mock site (static HTML); Partner Carrier API mock (FastAPI/uvicorn); Open-Meteo public archive API (optional) |
 | **Deployment** | Docker Compose v2 (5 services), BuildKit, Compose `additional_contexts` for build-time fixture baking, named volumes (`warehouse_data`, `cache_data`); all images run as `root` (no `USER` directive) |
-| **AI / LLM** | Anthropic API — **configured and gracefully handled, call not yet implemented**; model pinned via `ANTHROPIC_MODEL` (default `claude-sonnet-4-5`) for when it is |
-| **Testing** | `pytest` 8.3.4 + `httpx` 0.28.1 (`backend/requirements-dev.txt`, dev-only, not in any image): 33 SQL-guard unit tests, parametrized validation regression tests, and warehouse-backed integration tests covering all 8 illustrative questions, OTIF-by-outlet, and every region-filter path. 122 tests total. No CI pipeline runs this suite automatically today. |
+| **AI / LLM** | Groq API (`groq` Python SDK) — **implemented and live**; model pinned via `GROQ_MODEL` (default `llama-3.3-70b-versatile`). `ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` remain in config for compatibility but are unused. |
+| **Testing** | `pytest` 8.3.4 + `httpx` 0.28.1 (`backend/requirements-dev.txt`, dev-only, not in any image): 33 SQL-guard unit tests, 53 privacy-layer unit/integration tests, parametrized validation regression tests, and warehouse-backed integration tests covering all 8 illustrative questions, OTIF-by-outlet, and every region-filter path. 185 tests total. No CI pipeline runs this suite automatically today. |
 
 ---
 
@@ -690,9 +744,9 @@ What exists today:
 | **OTIF grouping parity** | Add `group_by=outlet` to match fill rate | Brief asked for both metrics by the same four dimensions; this was a gap, not a scope decision | None — pure completion of an existing, already-approved capability |
 | **Regional-manager scope** | Plain `region_code` `WHERE` filter, threaded through 6 of 7 metric routers + Ask Anything, no auth | Brief: "make it work for regional managers too" — narrowest change that satisfies it without inventing accounts/roles for a single-tenant tool | Not a real access-control boundary — anyone can view any region; acceptable because there's no notion of "belongs to a manager" being protected |
 | **Price Position region exclusion** | No `region_code` param; explicit UI callout instead of silent no-op | Competitor data has no city→region mapping in this dataset; fabricating one would silently mislead | Feature parity gap versus other pages, surfaced honestly rather than hidden |
-| **SQL guard hardening** | Resolve quoted/schema-qualified/comment-obfuscated identifiers, and reject comma-separated FROM lists, before the allowlist check | Four real bypasses found across two audit passes (most recently `FROM a, b` in the final release audit); fixed proactively even though the LLM path it guards isn't live yet | More complex regex/parsing logic to maintain; mitigated by 33 dedicated unit tests |
+| **SQL guard hardening** | Resolve quoted/schema-qualified/comment-obfuscated identifiers, and reject comma-separated FROM lists, before the allowlist check | Four real bypasses found across two audit passes (most recently `FROM a, b` in the final release audit); fixed proactively, and the LLM path it guards is now live and runs every generated query through it | More complex regex/parsing logic to maintain; mitigated by 33 dedicated unit tests |
 | Analytical views over raw tables | Warehouse build cleans once; raw schema physically dropped afterward | One place owns every data-quality fix; impossible for any downstream code to see uncleaned data | Any new cleaning rule requires a warehouse rebuild, not a live query change |
-| Ask Anything design | 8 deterministic fast paths + designed-but-unimplemented LLM fallback | Guarantees the 8 brief questions always work, zero hallucination risk; safety contract built ahead of the LLM call | Free-form questions outside the 8 don't work yet even with a key configured — an honest gap, not a fake integration |
+| Ask Anything design | 8 deterministic fast paths + a real Groq-backed LLM fallback, guard-validated | Guarantees the 8 brief questions always work with zero hallucination risk and always take priority; free-form questions get real coverage once a key is configured, with the same read-only guard enforced on generated SQL as everything else | Free-form answer quality depends on the model's SQL, not a tested query; no response caching yet, so repeated questions cost a fresh Groq call each time |
 | Competitor SKU matching | Conservative (brand + category + pack size, name-overlap tiebreak); ambiguous excluded | A wrong "confident" price comparison is worse than a missing one | ~46% of listings never appear in any price-gap view |
 | **Real pytest suite** | Runs against the actual built warehouse, not mocks; DB-independent tests (SQL guard, validation) run on a clean checkout | The thing worth testing is the SQL and validation contracts, not a fake stand-in; DB-independent tests must work with zero setup | Warehouse-dependent tests need the ETL step run first, and self-skip (not fail) when it hasn't been — correct behaviour, but means "all green" doesn't guarantee warehouse-backed tests actually ran |
 
