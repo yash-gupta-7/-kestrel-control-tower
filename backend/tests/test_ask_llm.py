@@ -192,6 +192,46 @@ def test_blocked_personal_data_categories_all_blocked(client, groq_configured, m
     assert calls == []
 
 
+# ---------------------------------------------------------------------------
+# Closed gap: direct requests for a protected personal-data category (names,
+# not just contact-value fields) must be caught by the question-level check
+# and never reach Groq at all -- mode="blocked", sql=None, no network call.
+# See privacy.py's _BLOCKED_REQUEST_PHRASES and DECISIONS.md.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("question", [
+    "List all salesperson full names",
+    "Show warehouse manager names",
+    "Give regional manager names",
+])
+def test_salesperson_and_manager_name_requests_blocked_before_groq(client, groq_configured, monkeypatch, question):
+    calls = []
+    _fake_groq_client(monkeypatch, calls)
+    resp = client.post("/ask", json={"question": question})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["mode"] == "blocked"
+    assert body["sql"] is None
+    assert body["data"] is None
+    assert calls == [], "Groq must never be called for a blocked personal-data-name request"
+
+
+@pytest.mark.parametrize("question", [
+    "Which region has the highest freight cost?",
+    "Which outlets had the highest fill rate?",
+])
+def test_legitimate_business_questions_not_blocked(client, groq_configured, monkeypatch, question):
+    """The two explicit non-PII sanity checks: a legitimate business
+    question must not be caught by the widened phrase list -- it either
+    hits a fast path or genuinely reaches Groq, never mode="blocked"."""
+    calls = []
+    _fake_groq_client(monkeypatch, calls)
+    resp = client.post("/ask", json={"question": question})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["mode"] in ("fast_path", "llm")
+
+
 def test_pii_value_in_question_never_reaches_groq(client, groq_configured, monkeypatch):
     """The exact scenario from the security review: a question containing
     an embedded email address. The original PII must never be sent to

@@ -90,8 +90,13 @@ _BLOCKED_REQUEST_PHRASES = (
     "personal address", "personal addresses", "home address",
     "aadhaar", "pan number", "pan card",
     "bank account", "bank details", "account number",
-    "personal notes", "manager name", "manager's name", "employee name", "employee names",
-    "salesperson's name", "salesperson name",
+    "personal notes", "manager name", "manager's name", "manager names",
+    "employee name", "employee names", "employee full name", "employee full names",
+    "salesperson's name", "salesperson name", "salesperson names",
+    "salesperson full name", "salesperson full names",
+    "warehouse manager name", "warehouse manager names",
+    "regional manager name", "regional manager names",
+    "personal contact details", "contact details",
     "gst number", "gstin",
 )
 

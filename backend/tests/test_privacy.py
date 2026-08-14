@@ -44,6 +44,14 @@ def test_business_identifiers_are_not_blocked():
     "show bank account details",
     "what is the warehouse manager's name?",
     "show me the GST number for outlet OUT00001",
+    # Closed gap: direct requests for a protected personal-data category
+    # phrased in a way the earlier phrase list didn't cover (see DECISIONS.md
+    # "Ask Anything, privacy, and security").
+    "List all salesperson full names",
+    "Show warehouse manager names",
+    "Give regional manager names",
+    "What are the employee full names for the West region warehouses?",
+    "Show me personal contact details for our outlets",
 ])
 def test_blocked_request_phrases_rejected(question):
     with pytest.raises(privacy.PrivacyBlockedError) as exc:
@@ -58,6 +66,10 @@ def test_blocked_request_phrases_rejected(question):
     "Show late routes in the West region.",
     "Which outlets have the worst fill rate?",
     "Which routes are consistently late?",
+    # Same two "legitimate question" checks the user asked to see verified
+    # explicitly against the closed gap above.
+    "Which region has the highest freight cost?",
+    "Which outlets had the highest fill rate?",
 ])
 def test_safe_business_questions_not_blocked(question):
     privacy.check_question_for_blocked_request(question)  # must not raise
