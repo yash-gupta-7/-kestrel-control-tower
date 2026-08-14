@@ -76,7 +76,7 @@ That build-time split exists for a concrete reason, not just tidiness: a
 `volumes:` bind mount to an arbitrary host path has to be allow-listed in
 Docker Desktop's File Sharing settings, which is exactly what broke on
 first real Docker Desktop testing (`the path /partner_api is not shared
-from the host` — see DECISIONS.md for the full root cause). A Docker
+from the host`). A Docker
 build context is a one-time file read by the Docker CLI and isn't subject
 to that restriction at all, so moving the two static fixtures to
 build-time `COPY` removes the File Sharing dependency for them entirely —
@@ -97,17 +97,23 @@ under Docker Desktop → Settings → Resources → File Sharing.
   ones from the assignment brief. Those 8 are answered deterministically by
   hand-written, tested queries, with zero external dependencies. Anything
   else is answered by asking an LLM (Groq) to write a SQL query — the
-  generated SQL is displayed alongside the answer for auditability, and is
-  validated read-only against the same approved analytical views before it
-  ever runs (see "SQL guard" in DECISIONS.md). Without `GROQ_API_KEY` set,
+  generated SQL is capped at a few seconds of execution time and a row
+  limit, then shown behind a **Show SQL** toggle underneath the answer
+  (hidden by default, so the answer stays the primary thing you read; click
+  to reveal it for auditability, click **Hide SQL** to collapse it again) —
+  and is validated read-only against the same approved analytical views
+  before it ever runs (see `backend/app/sql_guard.py` and "Ask Anything,
+  privacy, and security" in DECISIONS.md). Without `GROQ_API_KEY` set,
   free-form questions get a clear "AI unavailable" response instead of
-  failing. Ask Anything applies rule-based privacy filtering before
-  sending a question to the LLM. Personal-data fields are excluded from
-  the LLM schema and blocked queries are rejected before execution (see
-  "Personal data protection" in DECISIONS.md).
+  failing; a Groq failure or timeout degrades the same way, never a broken
+  page. Ask Anything applies rule-based privacy filtering before sending a
+  question to the LLM. Personal-data fields are excluded from the LLM
+  schema and blocked queries are rejected before execution (see
+  `backend/app/privacy.py` and "Ask Anything, privacy, and security" in
+  DECISIONS.md) — blocked responses never show a SQL toggle at all.
 - **Cold Chain** — temperature excursions, near-expiry stock, cold-chain
-  returns. Deliberately lighter than Service/Money/Ask (see priority
-  allocation in DECISIONS.md).
+  returns. Deliberately lighter than Service/Money/Ask, matching the
+  brief's own emphasis on service and money first.
 - **Price Position** — Kestrel MRP vs. observed competitor price,
   confidently-matched SKUs only; everything else is shown as "no
   confident match," not guessed.
@@ -116,7 +122,8 @@ Two findings are surfaced deliberately as network-wide patterns rather
 than routine metrics: **all 140 routes** exceed a 2-hour-late threshold on
 more than 1 in 10 deliveries, and **all 724 outlets** have at some point
 ordered a discontinued SKU. Both are real, verified against the data —
-see DECISIONS.md for how.
+see the `q5`/`q8` handlers in `backend/app/routers/ask.py` for the exact
+query and framing.
 
 ## Running without Docker
 
@@ -135,6 +142,7 @@ python3 etl/scrape_bazaarpulse.py
 python3 etl/pull_freight_invoices.py
 python3 etl/pull_weather.py
 python3 etl/build_warehouse.py
+python3 etl/validate_warehouse.py   # data-quality gate -- must exit 0 before serving this warehouse
 
 # 3. Backend
 pip install -r backend/requirements.txt
@@ -148,6 +156,25 @@ cd frontend && npm install && npm run dev
 Open http://localhost:5173 (Vite's dev server port; the Docker setup
 serves the production build on :3000 instead).
 
+## Running the tests / evaluation set
+
+```bash
+pip install -r backend/requirements-dev.txt
+
+# Full pytest suite (sql_guard + validation tests run with no warehouse at
+# all; everything else needs warehouse/warehouse.duckdb built -- see above)
+pytest backend/tests/
+
+# Ask Anything evaluation set: ~20 representative questions (all 8 fast
+# paths, analytical/regional/date questions, unsupported questions, PII
+# requests and PII values, SQL-injection-shaped questions, malformed
+# input). Honours a real GROQ_API_KEY if one is set in your shell/`.env`
+# and exercises the live Groq path; without one, verifies the same
+# graceful "AI unavailable" degradation the app itself falls back to.
+python3 backend/tests/eval_ask_anything.py
+# or: pytest backend/tests/eval_ask_anything.py
+```
+
 ## Configuration reference
 
 | Variable | Where | Default | Purpose |
@@ -155,6 +182,10 @@ serves the production build on :3000 instead).
 | `ASSIGNMENT_PACK_DIR` | `.env`, Docker only | — (required, build fails without it) | Path to the unzipped assignment pack. Used as a runtime mount source for `data/`, and as a build-time source for `bazaarpulse_site/`/`partner_api/` |
 | `GROQ_API_KEY` | `.env` / shell env | empty | Enables the free-form Ask Anything path (LLM-generated, SQL-guard-validated queries). Optional. |
 | `GROQ_MODEL` | `.env` / shell env | `llama-3.3-70b-versatile` | Which Groq model answers free-form questions. |
+| `GROQ_TIMEOUT_SECONDS` | shell env | `15` | Network timeout on the Groq API call itself. |
+| `GROQ_MAX_RETRIES` | shell env | `1` | Retries on the Groq call, transient network/timeout failures only (the SDK's own behaviour) — never on a bad key, a malformed response, or a guard rejection. |
+| `ASK_QUERY_TIMEOUT_SECONDS` | shell env | `10` | Wall-clock cap on running LLM-generated SQL against the warehouse before it's cancelled. Fast-path queries aren't subject to this. |
+| `MAX_ROWS_RETURNED` | shell env | `500` | Hard cap on rows returned by any single query, fast-path or LLM. |
 | `ANTHROPIC_API_KEY` | `.env` / shell env | empty | Legacy/unused — kept for compatibility with earlier docs; no code path calls it. |
 | `KESTREL_DB_PATH` | ETL env | `/data/kestrel_ops.db` | Path to the SQLite operational DB |
 | `WAREHOUSE_DB_PATH` | ETL + backend env | `warehouse/warehouse.duckdb` | The cleaned DuckDB store both read/write |
@@ -163,14 +194,29 @@ serves the production build on :3000 instead).
 ## Project structure
 
 ```
-etl/        Scraper, freight-invoice puller, weather puller, warehouse builder
+etl/        Scraper, freight-invoice puller, weather puller, warehouse builder,
+            validate_warehouse.py (post-build data-quality gate)
 backend/    FastAPI app: routers/ (health, service, money, cold_chain, price_position, ask)
+            tests/ (pytest suite + eval_ask_anything.py)
 frontend/   React/Vite dashboard
 docker/     Dockerfiles for the bazaarpulse and partner-api mock-service wrappers
             (both COPY their fixture in from ASSIGNMENT_PACK_DIR at build time)
 ```
 
 ## Troubleshooting
+
+**`etl` container fails at the last step with a data-quality gate failure.**
+`etl/validate_warehouse.py` runs after `build_warehouse.py` and refuses to
+let a broken warehouse (missing tables, empty core facts, orphaned foreign
+keys, unexpected nulls on a business key, a wildly-out-of-range date) reach
+the backend — `docker compose logs etl` shows exactly which check(s)
+failed. This is a real build problem, not a flaky step; re-running won't
+fix it if the underlying data genuinely failed a check. If a warehouse
+built by an older version of this repo is lying around in the
+`warehouse_data` volume (from before this gate existed), `GET /health`
+reports `warehouse_validated: false` and every data-serving endpoint
+returns a 503 until you rebuild — `docker compose up --build
+--force-recreate` forces a fresh ETL run.
 
 **`docker compose` refuses to start, complaining about `ASSIGNMENT_PACK_DIR`.**
 That's intentional — it means the variable is unset or blank in `.env`.
