@@ -14,6 +14,12 @@ const MODE_LABEL = {
   blocked: "Not available",
 };
 
+let historyIdCounter = 0;
+function makeHistoryId() {
+  historyIdCounter += 1;
+  return `ask-${Date.now()}-${historyIdCounter}`;
+}
+
 function GenericDataTable({ rows }) {
   if (!rows || rows.length === 0) return null;
   const cols = Object.keys(rows[0]);
@@ -55,6 +61,16 @@ function GenericDataTable({ rows }) {
 }
 
 function AnswerCard({ item }) {
+  const [sqlVisible, setSqlVisible] = useState(false);
+  // SQL stays available for auditability (fast-path and Groq-generated
+  // answers both carry it, unchanged backend contract) but is secondary to
+  // the business answer, so it's collapsed by default behind a toggle.
+  // Never shown at all for mode="blocked" -- a blocked/privacy response
+  // has nothing worth auditing here, and some blocked responses do carry
+  // the SQL that got blocked (see ask.py's privacy layer) purely for
+  // server-side/API-level audit, not for display.
+  const canShowSql = Boolean(item.sql) && item.mode !== "blocked";
+
   return (
     <Card className="answer-card">
       <div className="card-header-row">
@@ -64,9 +80,21 @@ function AnswerCard({ item }) {
         <span className={`badge mode-badge-${item.mode}`}>{MODE_LABEL[item.mode] || item.mode}</span>
       </div>
       <p className="answer-text">{item.answer}</p>
-      {item.sql && <pre className="sql-block">{item.sql}</pre>}
       <GenericDataTable rows={item.data} />
       <CaveatList caveats={item.caveats} />
+      {canShowSql && (
+        <>
+          <button
+            type="button"
+            className="btn-sql-toggle"
+            onClick={() => setSqlVisible((v) => !v)}
+            aria-expanded={sqlVisible}
+          >
+            {sqlVisible ? "Hide SQL" : "Show SQL"}
+          </button>
+          {sqlVisible && <pre className="sql-block">{item.sql}</pre>}
+        </>
+      )}
       {item.source && (
         <div className="text-faint" style={{ marginTop: 10, fontSize: 11 }}>
           Source: {item.source}
@@ -91,10 +119,11 @@ export default function AskAnything() {
     setQuestion("");
     try {
       const result = await apiPost("/ask", { question: text, region_code: regionCode || undefined });
-      setHistory((h) => [result, ...h]);
+      setHistory((h) => [{ ...result, _id: makeHistoryId() }, ...h]);
     } catch (e) {
       setHistory((h) => [
         {
+          _id: makeHistoryId(),
           question: text,
           mode: "unavailable",
           answer: `Something went wrong asking that: ${e.message}`,
@@ -162,8 +191,8 @@ export default function AskAnything() {
         </Card>
       )}
 
-      {history.map((item, i) => (
-        <AnswerCard key={i} item={item} />
+      {history.map((item) => (
+        <AnswerCard key={item._id} item={item} />
       ))}
     </div>
   );

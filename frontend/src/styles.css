@@ -711,7 +711,26 @@ table.dt th.num {
   font-size: 12px;
   overflow-x: auto;
   white-space: pre-wrap;
+  word-break: break-word;
   margin: 8px 0;
+  max-width: 100%;
+}
+
+.btn-sql-toggle {
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  margin-top: 4px;
+}
+
+.btn-sql-toggle:hover {
+  background: var(--color-neutral-bg);
+  color: var(--color-text);
 }
 
 .mode-badge-fast_path {
