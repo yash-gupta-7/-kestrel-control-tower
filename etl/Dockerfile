@@ -11,4 +11,5 @@ COPY etl/ ./etl/
 CMD python3 etl/scrape_bazaarpulse.py && \
     python3 etl/pull_freight_invoices.py && \
     python3 etl/pull_weather.py && \
-    python3 etl/build_warehouse.py
+    python3 etl/build_warehouse.py && \
+    python3 etl/validate_warehouse.py

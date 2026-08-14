@@ -54,3 +54,6 @@ class HealthResponse(BaseModel):
     warehouse_path: str
     tables: list[str] = Field(default_factory=list)
     llm_configured: bool
+    warehouse_validated: bool = False
+    warehouse_validated_at: Optional[str] = None
+    warehouse_validation_detail: Optional[str] = None

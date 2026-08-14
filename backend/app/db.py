@@ -32,6 +32,28 @@ ALLOWED_TABLES = {
 }
 
 
+def _warehouse_validation_status(con) -> tuple[bool, str]:
+    """Reads the pass/fail verdict etl/validate_warehouse.py recorded
+    directly in the warehouse file. Returns (ok, detail). A missing
+    _warehouse_meta table means validate_warehouse.py never ran against
+    this file at all (e.g. an old warehouse built before this gate
+    existed, or a manual/local build that skipped the step) -- treated
+    the same as a failed validation, since an unvalidated warehouse and a
+    validated-and-broken one are both states the backend must not serve
+    silently. This is defense in depth beyond docker-compose.yml's
+    `service_completed_successfully` gate, which only protects the
+    documented `docker compose up` path (see etl/validate_warehouse.py)."""
+    exists = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_warehouse_meta'"
+    ).fetchone()[0] > 0
+    if not exists:
+        return False, "no _warehouse_meta table -- warehouse was never run through validate_warehouse.py"
+    status, detail = con.execute(
+        "SELECT status, detail FROM _warehouse_meta ORDER BY validated_at DESC LIMIT 1"
+    ).fetchone()
+    return status == "ok", detail
+
+
 @contextmanager
 def get_connection():
     if not config.WAREHOUSE_DB_PATH.exists():
@@ -42,12 +64,49 @@ def get_connection():
                 "Run the ETL step first: see README 'Setup' section "
                 "(python3 etl/scrape_bazaarpulse.py && "
                 "python3 etl/pull_freight_invoices.py && "
-                "python3 etl/pull_weather.py && python3 etl/build_warehouse.py)."
+                "python3 etl/pull_weather.py && python3 etl/build_warehouse.py "
+                "&& python3 etl/validate_warehouse.py)."
             ),
         )
     con = duckdb.connect(str(config.WAREHOUSE_DB_PATH), read_only=True)
+    ok, detail = _warehouse_validation_status(con)
+    if not ok:
+        con.close()
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Warehouse at {config.WAREHOUSE_DB_PATH} failed (or never ran) its "
+                f"data-quality gate: {detail}. Re-run python3 etl/validate_warehouse.py "
+                "and fix the reported check(s) before serving this warehouse."
+            ),
+        )
     try:
         yield con
+    finally:
+        con.close()
+
+
+def warehouse_validation_info() -> dict:
+    """Non-raising counterpart to get_connection()'s validation gate, for
+    GET /health to report the real reason a warehouse is being refused
+    (or accepted) without itself failing the health check's own JSON
+    response shape. Returns a dict the caller can put straight into
+    HealthResponse; never raises for a missing/failed-validation warehouse
+    -- that's exactly the state /health exists to surface."""
+    if not config.WAREHOUSE_DB_PATH.exists():
+        return {"validated": False, "validated_at": None, "validation_detail": "warehouse file not found"}
+    con = duckdb.connect(str(config.WAREHOUSE_DB_PATH), read_only=True)
+    try:
+        exists = con.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_warehouse_meta'"
+        ).fetchone()[0] > 0
+        if not exists:
+            return {"validated": False, "validated_at": None,
+                     "validation_detail": "never run through etl/validate_warehouse.py"}
+        validated_at, status, detail = con.execute(
+            "SELECT validated_at, status, detail FROM _warehouse_meta ORDER BY validated_at DESC LIMIT 1"
+        ).fetchone()
+        return {"validated": status == "ok", "validated_at": str(validated_at), "validation_detail": detail}
     finally:
         con.close()
 

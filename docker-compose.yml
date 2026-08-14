@@ -90,7 +90,13 @@ services:
     ports:
       - "8000:8000"
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      # Checks the JSON body's status field, not just HTTP 200 -- /health
+      # returns 200 with status="degraded" for a warehouse that failed (or
+      # never ran) etl/validate_warehouse.py's data-quality gate (see
+      # backend/app/routers/health.py), and a bare HTTP-success check would
+      # have missed that, letting the container report healthy while
+      # serving a warehouse the gate rejected.
+      test: ["CMD", "python3", "-c", "import json,sys,urllib.request; d=json.load(urllib.request.urlopen('http://localhost:8000/health')); sys.exit(0 if d.get('status')=='ok' else 1)"]
       interval: 3s
       timeout: 3s
       retries: 20
