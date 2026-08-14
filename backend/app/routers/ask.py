@@ -30,6 +30,7 @@ degrades to mode="blocked" -- never a 500, never partial data.
 import json
 import logging
 import re
+import threading
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -384,17 +385,77 @@ class GroqCallError(Exception):
     SQL it returned failing the guard, which is a SQLGuardError instead."""
 
 
+class AskQueryTimeoutError(Exception):
+    """LLM-generated SQL didn't finish within ASK_QUERY_TIMEOUT_SECONDS and
+    was cancelled. Distinct from a normal execution failure (HTTPException
+    from db.run_query) so ask() can give a specific, honest message instead
+    of the generic "failed to execute" one."""
+
+
+def _run_llm_sql_with_timeout(con, sql: str, timeout_seconds: float) -> list[dict]:
+    """Executes LLM-generated `sql` via db.run_query() on a worker thread,
+    and cancels it with DuckDB's cross-thread Connection.interrupt() if it
+    hasn't finished within timeout_seconds. Fast-path queries never go
+    through this -- they're hand-written, known-cheap, and already bounded
+    (small LIMITs or an inherently small result). This exists specifically
+    because Groq-generated SQL is unpredictable: an accidental cross join
+    or an unindexed aggregate over the largest fact table could otherwise
+    tie up the shared warehouse file for one free-form question.
+
+    Verified behaviour (DuckDB 1.5.x): interrupt() on a connection that's
+    executing on another thread raises a catchable error on that thread
+    within roughly the polling interval, not after the query would have
+    finished naturally -- this is a real cancellation, not a client-side
+    give-up that leaves the query running server-side."""
+    outcome: dict = {}
+
+    def _target():
+        try:
+            outcome["rows"] = run_query(con, sql)
+        except BaseException as e:  # noqa: BLE001 -- re-raised on the caller's thread below
+            outcome["error"] = e
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        con.interrupt()
+        worker.join(timeout_seconds)  # let the interrupted call unwind cleanly before returning
+        raise AskQueryTimeoutError(
+            f"Query did not complete within {timeout_seconds:.0f}s and was cancelled."
+        )
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["rows"]
+
+
 _groq_client = None
 
 
 def _get_groq_client():
     # Imported lazily so a missing/unconfigured `groq` package only breaks
     # the LLM path, never the fast paths or app startup.
+    #
+    # timeout/max_retries: the groq SDK is httpx-based (same shape as the
+    # OpenAI SDK) and retries transient failures -- connection errors,
+    # timeouts, 429/5xx -- internally, up to max_retries times; it does not
+    # retry a 4xx (e.g. a bad API key) or anything that only goes wrong
+    # after a response body already came back (malformed JSON, a guard
+    # rejection) -- those happen in our own code below, after this call
+    # returns, and are never retried. max_retries=1 caps this at exactly
+    # one retry, satisfying "at most one retry, transient failures only."
+    # Without an explicit timeout the SDK's default is generous enough that
+    # a hung request could sit well past what a synchronous API request
+    # should ever wait -- GROQ_TIMEOUT_SECONDS bounds that explicitly.
     global _groq_client
     if _groq_client is None:
         from groq import Groq
 
-        _groq_client = Groq(api_key=config.GROQ_API_KEY)
+        _groq_client = Groq(
+            api_key=config.GROQ_API_KEY,
+            timeout=config.GROQ_TIMEOUT_SECONDS,
+            max_retries=config.GROQ_MAX_RETRIES,
+        )
     return _groq_client
 
 
@@ -533,7 +594,19 @@ def ask(req: AskRequest):
 
     try:
         with get_connection() as con:
-            rows = run_query(con, validated_sql)
+            rows = _run_llm_sql_with_timeout(con, validated_sql, config.ASK_QUERY_TIMEOUT_SECONDS)
+    except AskQueryTimeoutError:
+        return AskResult(
+            question=req.question, mode="llm_error",
+            answer=(
+                "This question's generated query took too long to run and was stopped before "
+                "returning any data -- see caveats for the limit applied."
+            ),
+            sql=validated_sql,
+            caveats=[f"Ask Anything queries are capped at {config.ASK_QUERY_TIMEOUT_SECONDS:.0f} seconds "
+                     "to protect the shared warehouse from a single expensive query. Try a narrower "
+                     "question (a shorter period, a specific region) rather than retrying as-is."],
+        )
     except HTTPException as e:
         return AskResult(
             question=req.question, mode="llm_error",
@@ -549,6 +622,18 @@ def ask(req: AskRequest):
     except privacy.PrivacyBlockedError as e:
         return _blocked(req, e.reason, sql=validated_sql)
 
+    # MAX_ROWS_RETURNED (db.run_query) caps every query's result, fast-path
+    # or LLM. If this one hit that cap exactly, more rows may genuinely
+    # exist and were silently dropped -- flagged here rather than left
+    # implicit, so "top 500 rows" isn't mistaken for "all matching rows".
+    # There's no cheap way to tell "exactly N rows exist" from "truncated
+    # at N" without a second COUNT(*) query for a display-only caveat, so
+    # this is deliberately phrased as "may be more", not a precise count.
+    truncation_caveat = (
+        [f"Results were capped at {config.MAX_ROWS_RETURNED} rows -- there may be more rows than shown."]
+        if len(rows) == config.MAX_ROWS_RETURNED else []
+    )
+
     answer = f"{answer_intro} ({len(rows)} row{'s' if len(rows) != 1 else ''} returned)."
     return AskResult(
         question=req.question, mode="llm",
@@ -558,7 +643,9 @@ def ask(req: AskRequest):
             "This answer was generated by an AI model from your question, not by a human-written, "
             "tested query like the 8 supported questions -- the SQL is shown above so you can verify "
             "it before relying on the result.",
-        ] + (["Region scoping for free-form questions is a prompt instruction to the model, not a "
-              "structural guarantee the way it is on the dashboard endpoints -- check the SQL above if "
-              "the region scope matters for this answer."] if req.region_code else []),
+        ] + truncation_caveat + (
+            ["Region scoping for free-form questions is a prompt instruction to the model, not a "
+             "structural guarantee the way it is on the dashboard endpoints -- check the SQL above if "
+             "the region scope matters for this answer."] if req.region_code else []
+        ),
     )
