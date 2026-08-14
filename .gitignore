@@ -26,3 +26,16 @@ frontend/vite.config.js.timestamp-*.mjs
 # submission repo.
 Kestrel_Control_Tower_Project_Tracker.xlsx
 throwaway.txt
+
+# Claude Code local session settings -- machine/session-specific, not
+# project source. Never committed by any earlier commit in this repo.
+.claude/
+
+# Unreferenced diagram-export PNGs -- no .md file in this repo links to
+# docs/diagrams/ (docs/HLD.md's actual diagrams are the 9 inline mermaid
+# blocks already in that file, which render natively on GitHub); these are
+# a later, untracked, orphaned export with no commit history behind them.
+# Not deleted -- if you want them as real doc assets, link them from
+# HLD.md and un-ignore; left out of the repo as-is to avoid committing
+# ~4MB of unreferenced binary images.
+docs/diagrams/
